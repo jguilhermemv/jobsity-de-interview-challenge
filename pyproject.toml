@@ -1,0 +1,57 @@
+[tool.poetry]
+name = "jobsity-de-challenge"
+version = "0.1.0"
+description = "Local, containerized data engineering challenge with Kafka, Spark, and PostGIS."
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{ include = "de_challenge", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.110.0"
+uvicorn = { version = "^0.27.0", extras = ["standard"] }
+pydantic = "^2.6.0"
+python-json-logger = "^2.0.7"
+kafka-python = "^2.0.2"
+python-dateutil = "^2.9.0"
+geohash2 = "^1.1"
+opentelemetry-api = "^1.23.0"
+opentelemetry-sdk = "^1.23.0"
+opentelemetry-instrumentation-fastapi = "^0.44b0"
+opentelemetry-instrumentation-logging = "^0.44b0"
+psycopg2-binary = "^2.9.9"
+pyspark = "^3.5.1"
+delta-spark = "^3.2.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+ruff = "^0.3.0"
+black = "^24.2.0"
+isort = "^5.13.0"
+mypy = "^1.8.0"
+
+[tool.black]
+line-length = 100
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

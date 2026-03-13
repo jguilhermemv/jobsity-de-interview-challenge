@@ -166,8 +166,8 @@ Based on the challenge requirements and data/software engineering best practices
 ## 7) Grouping by similar origin/destination/time
 
 ### Strategy
-- Convert coordinates to **geohash/H3** at a chosen resolution (e.g., 7-9).
-- Define `time_bucket` (e.g., 30-min window or hourly).
+- Convert coordinates to **geohash** at precision **7**.
+- Define `time_bucket` as a **30-minute window**.
 - Group by `(origin_cell, destination_cell, time_bucket)`.
 
 ### Rationale
@@ -190,7 +190,7 @@ Based on the challenge requirements and data/software engineering best practices
 
 ### Strategy
 - Pipeline publishes events to `ingestion.status`.
-- API keeps an SSE/WebSocket connection with the client.
+- API keeps an **SSE** connection with the client.
 - Client receives messages like `STARTED`, `IN_PROGRESS`, `COMPLETED`, `FAILED`.
 
 ### Rationale
