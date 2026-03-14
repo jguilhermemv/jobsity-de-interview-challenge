@@ -49,6 +49,9 @@ IFS=$'\n\t'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# ── Demo-wide start time (set before any flag parsing so --help doesn't skew it)
+DEMO_START=$(date +%s)
+
 # ── Colour palette ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GRN='\033[0;32m'
@@ -82,6 +85,12 @@ done
 # ── Pretty helpers ─────────────────────────────────────────────────────────────
 hr()       { echo -e "${DIM}$(printf '─%.0s' {1..72})${NC}"; }
 
+# Returns elapsed time since DEMO_START as HH:MM:SS
+elapsed() {
+  local s=$(( $(date +%s) - DEMO_START ))
+  printf "%02d:%02d:%02d" $(( s/3600 )) $(( (s%3600)/60 )) $(( s%60 ))
+}
+
 banner() {
   echo
   echo -e "${BOLD}${BLU}╔$(printf '═%.0s' {1..72})╗${NC}"
@@ -91,10 +100,11 @@ banner() {
   echo -e "${BOLD}${BLU}╚$(printf '═%.0s' {1..72})╝${NC}"
 }
 
+# section <title>  — prints a cyan box header with elapsed time on the right
 section() {
   echo
   echo -e "${BOLD}${CYN}┌$(printf '─%.0s' {1..72})┐${NC}"
-  printf "${BOLD}${CYN}│  ${NC}${BOLD}%-70s${CYN}│${NC}\n" "$1"
+  printf "${BOLD}${CYN}│  ${NC}${BOLD}%-59s${DIM}  +%-8s${CYN}│${NC}\n" "$1" "$(elapsed)"
   echo -e "${BOLD}${CYN}└$(printf '─%.0s' {1..72})┘${NC}"
 }
 
@@ -110,18 +120,79 @@ indent()  { sed 's/^/       /'; }
 # wait_for <label> <timeout_seconds> <shell_expression>
 wait_for() {
   local label="$1" timeout="$2" expr="$3"
-  local elapsed=0 interval=4
+  local elapsed_w=0 interval=4
   printf "     Waiting for %-42s" "$label ..."
   while ! eval "$expr" &>/dev/null 2>&1; do
-    if [[ $elapsed -ge $timeout ]]; then
+    if [[ $elapsed_w -ge $timeout ]]; then
       echo -e " ${RED}TIMEOUT (${timeout}s)${NC}"
       return 1
     fi
     printf "."
     sleep "$interval"
-    elapsed=$((elapsed + interval))
+    elapsed_w=$((elapsed_w + interval))
   done
-  echo -e " ${GRN}ready${NC}"
+  echo -e " ${GRN}ready${NC}  ${DIM}[+$(elapsed)]${NC}"
+}
+
+# watch_pg_counts <max_wait_seconds>
+# Refreshes PostgreSQL table counts in-place every 2 s until trips stabilizes
+# or max_wait is reached.  Uses ANSI cursor-up to overwrite previous output.
+watch_pg_counts() {
+  local max_wait="${1:-120}"
+  local interval=2
+  local elapsed_w=0
+  local prev_trips=-1
+  local stable=0
+  local NLINES=6   # 4 data rows + 1 blank line + 1 timestamp line
+  local first=true
+
+  echo
+  echo -e "     ${BOLD}Live PostgreSQL counts${NC}  ${DIM}(refreshes every ${interval}s — stops when stable)${NC}"
+  echo
+
+  while true; do
+    local trips_n;    trips_n=$(pg "SELECT COUNT(*) FROM trips;"         2>/dev/null | tr -d '[:space:]') || trips_n="?"
+    local clusters_n; clusters_n=$(pg "SELECT COUNT(*) FROM trip_clusters;" 2>/dev/null | tr -d '[:space:]') || clusters_n="?"
+    local regions_n;  regions_n=$(pg "SELECT COUNT(*) FROM regions;"       2>/dev/null | tr -d '[:space:]') || regions_n="?"
+    local ds_n;       ds_n=$(pg "SELECT COUNT(*) FROM datasources;"        2>/dev/null | tr -d '[:space:]') || ds_n="?"
+    local hms; hms=$(elapsed)
+
+    # On subsequent iterations move cursor up to overwrite previous output
+    if ! $first; then
+      printf '\033[%dA' $NLINES
+    fi
+    first=false
+
+    echo -e "\r\033[2K     ${CYN}trips            ${NC}  ${BOLD}${GRN}${trips_n}${NC}"
+    echo -e "\r\033[2K     ${CYN}trip_clusters    ${NC}  ${BOLD}${GRN}${clusters_n}${NC}"
+    echo -e "\r\033[2K     ${CYN}regions          ${NC}  ${BOLD}${GRN}${regions_n}${NC}"
+    echo -e "\r\033[2K     ${CYN}datasources      ${NC}  ${BOLD}${GRN}${ds_n}${NC}"
+    echo -e "\r\033[2K"
+    printf   "\r\033[2K     ${DIM}elapsed: +%s${NC}\n" "$hms"
+
+    # Stop once trips count has been unchanged for 3 consecutive checks
+    if [[ "$trips_n" =~ ^[0-9]+$ ]]; then
+      if [[ "$trips_n" -eq "$prev_trips" ]]; then
+        stable=$(( stable + 1 ))
+        if [[ $stable -ge 3 ]]; then
+          echo
+          ok "Counts stable (trips=${trips_n}) — Spark micro-batch complete"
+          return 0
+        fi
+      else
+        stable=0
+        prev_trips=$trips_n
+      fi
+    fi
+
+    elapsed_w=$(( elapsed_w + interval ))
+    if [[ $elapsed_w -ge $max_wait ]]; then
+      echo
+      warn "Watch timeout (${max_wait}s) — Spark may still be processing in the background"
+      return 0
+    fi
+    sleep $interval
+  done
 }
 
 # Run SQL in the trips database and print the result
@@ -558,7 +629,9 @@ wait_for "PostgreSQL rows (trip_clusters)" 300 \
 wait_for "PostgreSQL rows (trips)" 300 \
   'docker exec -i postgres psql -U trips -d trips -tAc "SELECT 1 FROM trips LIMIT 1" | grep -q 1'
 
-echo
+step "Watching table counts grow in real time"
+watch_pg_counts 120
+
 step "Gold Delta files on disk"
 echo
 echo -e "     ${BOLD}gold_trip_clusters${NC} (aggregated by geohash × time_bucket):"
