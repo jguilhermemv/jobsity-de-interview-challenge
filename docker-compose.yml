@@ -39,10 +39,16 @@ services:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - TRIPS_TOPIC=trips.raw
       - PUBLISH_DELAY_SECONDS=0.5
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=trips
+      - POSTGRES_USER=trips
+      - POSTGRES_PASSWORD=trips
     ports:
       - "8000:8000"
     depends_on:
       - kafka
+      - postgres
 
   spark-master:
     image: apache/spark:3.5.1

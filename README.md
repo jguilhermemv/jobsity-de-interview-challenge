@@ -8,18 +8,21 @@ Local, containerized data pipeline demonstrating Kafka ingestion, Spark Structur
 
 1. [Architecture](#architecture)
 2. [Is It Streaming or Batch?](#is-it-streaming-or-batch)
-3. [Quick Start](#quick-start)
+3. [Demo Throughput — Why Processing 100 Rows Takes ~10 Minutes](#demo-throughput--why-processing-100-rows-takes-10-minutes)
+4. [Quick Start](#quick-start)
    - [Option A — One-command Demo](#option-a--one-command-demo-recommended)
    - [Option B — Manual Step-by-step](#option-b--manual-step-by-step)
-4. [Reset and Reprocess from Scratch](#reset-and-reprocess-from-scratch)
-5. [Validate Each Pipeline Stage](#validate-each-pipeline-stage)
-6. [Connect to PostgreSQL via DBeaver](#connect-to-postgresql-via-dbeaver)
-7. [Observability Interfaces](#observability-interfaces)
-8. [Data Layout](#data-layout)
-9. [Airflow](#airflow)
-10. [Tests](#tests)
-11. [Development](#development)
-12. [Bonus Queries](#bonus-queries)
+5. [Reset and Reprocess from Scratch](#reset-and-reprocess-from-scratch)
+6. [Validate Each Pipeline Stage](#validate-each-pipeline-stage)
+7. [Query API — Weekly Average Trips](#query-api--weekly-average-trips)
+8. [API Documentation (Swagger / ReDoc)](#api-documentation-swagger--redoc)
+9. [Connect to PostgreSQL via DBeaver](#connect-to-postgresql-via-dbeaver)
+10. [Observability Interfaces](#observability-interfaces)
+11. [Data Layout](#data-layout)
+12. [Airflow](#airflow)
+13. [Tests](#tests)
+14. [Development](#development)
+15. [Bonus Queries](#bonus-queries)
 
 ---
 
@@ -77,6 +80,48 @@ Neither job is traditional batch. Both use the Spark Streaming API and run **con
 ### Micro-batch ≠ record-at-a-time
 
 Spark Structured Streaming processes data in time windows (micro-batches), not record by record. This differs from systems like Apache Flink with native continuous processing — but it is **fundamentally different from batch**: no scheduling required, already-processed data is never reprocessed, and new data is reacted to within seconds.
+
+---
+
+## Demo Throughput — Why Processing 100 Rows Takes ~10 Minutes
+
+When running `bash demo.sh`, the full pipeline (upload → PostgreSQL) takes roughly **9–12 minutes** for the 100-row sample. This is **intentional**, not a performance issue. Three factors combine:
+
+### 1. Intentional publish delay (`PUBLISH_DELAY_SECONDS=0.5`)
+
+Configured in `.env`, the API introduces a 0.5-second pause between publishing each Kafka event:
+
+```
+100 rows × 0.5 s = 50 seconds to publish all events to Kafka
+```
+
+This simulates a realistic, continuous ingestion stream — without it, all 100 events would appear in Kafka in under a second, making the streaming behavior invisible. In production, `PUBLISH_DELAY_SECONDS` is set to `0`.
+
+### 2. Throttled micro-batch size (`maxFilesPerTrigger=1`, `trigger=5s`)
+
+Job 2 (Silver → Gold → PostgreSQL) is configured to process **one Silver Parquet file per micro-batch**, with a 5-second trigger interval. This makes each micro-batch step visible on screen as counts grow one batch at a time. In production, `maxFilesPerTrigger` is removed entirely and `trigger` is set to `processingTime 30 seconds` or driven by available data.
+
+### 3. Pipeline chain latency
+
+Data must flow through three sequential async stages before appearing in PostgreSQL:
+
+```
+Kafka publish (50 s total)
+  → Job 1 micro-batch: Kafka → Bronze → Silver  (~30–60 s first batch, then seconds)
+  → Job 2 micro-batch: Silver → Gold → PostgreSQL  (5 s per file × N files)
+```
+
+Each stage has its own independent trigger interval.
+
+### Tuning for speed (optional)
+
+To make the demo complete in ~2 minutes instead of ~10, set these values in `.env` before running:
+
+```env
+PUBLISH_DELAY_SECONDS=0
+```
+
+And in `src/de_challenge/spark/job2.py`, remove the `maxFilesPerTrigger` option. Rebuilding the `api` image (`docker compose build api`) is required after changing `.env`.
 
 ---
 
@@ -478,7 +523,56 @@ Stage 4 — Job 2 (Gold)
 
 Stage 5 — PostgreSQL
   SELECT count(*) FROM trip_clusters; \watch 2  →  counter rising in real time
+
+Stage 6 — Weekly average query
+  GET /trips/weekly-average?region=Prague  →  {"weekly_average": N, "num_weeks": M, ...}
+  GET /trips/weekly-average?min_lon=...    →  same shape, filtered by bounding box
 ```
+
+---
+
+## Query API — Weekly Average Trips
+
+The REST API exposes a query endpoint that returns the **weekly average number of trips** for a given area. No polling required; the result is a single synchronous HTTP response.
+
+### By region name
+
+```bash
+curl "http://localhost:8000/trips/weekly-average?region=Prague"
+```
+
+### By bounding box (coordinates)
+
+```bash
+curl "http://localhost:8000/trips/weekly-average?min_lon=14.0&min_lat=49.9&max_lon=14.6&max_lat=50.2"
+```
+
+**Response** (both variants):
+
+```json
+{
+  "weekly_average": 12.5,
+  "num_weeks": 4,
+  "total_trips": 50,
+  "filter": {"region": "Prague"}
+}
+```
+
+| Field | Description |
+|---|---|
+| `weekly_average` | Average number of trips per ISO week for the filtered area |
+| `num_weeks` | Number of distinct weeks that contained at least one trip |
+| `total_trips` | Total trips matching the filter |
+| `filter` | Echo of the filter actually applied |
+
+**Error responses**:
+
+| Status | Reason |
+|---|---|
+| `400 Bad Request` | No filter provided, or bounding-box params are incomplete |
+| `503 Service Unavailable` | PostgreSQL is unreachable |
+
+> The bounding-box filter uses PostGIS `ST_Within(origin_geom, ST_MakeEnvelope(...))` on the `trips` table — spatial index on `origin_geom` keeps queries fast even at scale.
 
 ---
 
@@ -516,12 +610,40 @@ To monitor inserts in real time: open a **SQL Editor**, run `SELECT count(*) FRO
 
 ---
 
+## API Documentation (Swagger / ReDoc)
+
+The FastAPI app auto-generates interactive API documentation from the code.
+
+| Interface | URL |
+|---|---|
+| **Swagger UI** | http://localhost:8000/docs |
+| **ReDoc** | http://localhost:8000/redoc |
+| **OpenAPI JSON** | http://localhost:8000/openapi.json |
+
+Open `http://localhost:8000/docs` in a browser to:
+
+- Browse all endpoints grouped by tag (`ingestion`, `trips`, `ops`)
+- Read descriptions, parameter types, and examples inline
+- Execute requests directly from the browser (upload a CSV, query weekly averages)
+- Inspect full request/response schemas
+
+The three available endpoints are:
+
+| Method | Path | Tag | Description |
+|---|---|---|---|
+| `POST` | `/ingestions` | ingestion | Upload a CSV file; returns `ingestion_id` |
+| `GET` | `/ingestions/{id}/events` | ingestion | SSE stream of ingestion status (no polling) |
+| `GET` | `/trips/weekly-average` | trips | Weekly average trips by region or bounding box |
+
+---
+
 ## Observability Interfaces
 
 | Interface | URL | Description |
 |---|---|---|
-| **API** | http://localhost:8000 | FastAPI — CSV upload, SSE status |
-| **API Docs** | http://localhost:8000/docs | Swagger UI |
+| **API** | http://localhost:8000 | FastAPI — CSV upload, SSE status, weekly-average query |
+| **Swagger UI** | http://localhost:8000/docs | Interactive API documentation |
+| **ReDoc** | http://localhost:8000/redoc | Alternative API documentation |
 | **Spark Master UI** | http://localhost:8080 | Active Spark jobs, workers, streaming queries |
 | **Airflow UI** | http://localhost:8081 | DAGs, task runs, logs |
 | **Kafka** | localhost:9092 | Broker (access via CLI tools) |

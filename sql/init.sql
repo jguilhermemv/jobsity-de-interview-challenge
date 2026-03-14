@@ -102,3 +102,30 @@ CREATE        INDEX IF NOT EXISTS idx_trips_origin_geom           ON trips USING
 CREATE        INDEX IF NOT EXISTS idx_trips_destination_geom      ON trips USING GIST(destination_geom);
 CREATE INDEX IF NOT EXISTS idx_trip_clusters_origin_cell   ON trip_clusters(origin_cell);
 CREATE INDEX IF NOT EXISTS idx_trip_clusters_dest_cell     ON trip_clusters(destination_cell);
+
+-- ---------------------------------------------------------------------------
+-- View: weekly average trips per region
+--
+-- Computes, for every (region, ISO week) pair, how many trips occurred that
+-- week.  The outer query averages those weekly counts, giving the mean number
+-- of trips per week for each region.  Useful for the mandatory feature:
+-- "obtain the weekly average number of trips for an area".
+-- ---------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW weekly_trips_by_region AS
+WITH weekly AS (
+    SELECT
+        region,
+        DATE_TRUNC('week', datetime) AS week_start,
+        COUNT(*)                     AS trip_count
+    FROM trips
+    GROUP BY region, week_start
+)
+SELECT
+    region,
+    ROUND(AVG(trip_count)::numeric, 2) AS weekly_average,
+    COUNT(*)                           AS num_weeks,
+    SUM(trip_count)                    AS total_trips
+FROM weekly
+GROUP BY region
+ORDER BY region;

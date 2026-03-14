@@ -1,13 +1,13 @@
 # Architecture Document — Trips Data Engineering Challenge
 
-> **Version**: 1.0 | **Date**: March 2026 | **Author**: João Guilherme
+> **Version**: 1.0 | **Date**: March 2026 | **Author**: José Guilherme
 
 ---
 
 ## Table of Contents
 
 1. [The Problem](#1-the-problem)
-2. [Conceptual Solution](#2-conceptual-solution)
+2. [Conceptual Solution](#2-conceptual-solution) *(includes CQRS and Event Sourcing — §2.4)*
 3. [How It Works End-to-End](#3-how-it-works-end-to-end)
 4. [Solution Structure (C4 Model)](#4-solution-structure-c4-model)
 5. [Answering the Challenge Questions](#5-answering-the-challenge-questions)
@@ -82,6 +82,25 @@ Rather than scheduled batch jobs, **Spark Structured Streaming** continuously co
 - **Fault tolerance**: checkpointing enables exactly-once semantics and automatic recovery
 - **Simplicity**: the same streaming code scales from the 100-row sample to 100M records
 
+### 2.4 Architectural Patterns: Adapted CQRS and Event Sourcing
+
+This architecture applies two well-known enterprise patterns in a **pragmatic, adapted form** — capturing their core benefits without the full formal overhead that would be unnecessary at this scale and access pattern.
+
+**Event Sourcing (adapted)**
+
+In formal Event Sourcing, every state change is persisted as an immutable event, and current state is derived by replaying those events. This architecture applies the same principle through Kafka: each CSV row becomes a discrete, immutable event published to `trips.raw`. With configurable retention, the topic serves as a durable event log that enables full reprocessing from any point in time. The Medallion layers (Bronze → Silver → Gold) are exactly the projections of this event log at different refinement levels — Bronze is the raw projection, Silver is the validated projection, Gold is the aggregated projection.
+
+A formal Event Sourcing implementation would add explicit aggregate roots, an event store, and projection rebuild tooling. That overhead is not justified here: Kafka's built-in offset management and Delta Lake's time-travel capability already cover the replay and audit requirements without additional infrastructure.
+
+**CQRS (adapted)**
+
+Command Query Responsibility Segregation separates the write model from the read model. This architecture implements that separation natively:
+
+- **Write path (Command side)**: `REST API → Kafka → Spark Job 1 → Spark Job 2 → PostgreSQL` — optimized for throughput, fault tolerance, and idempotency.
+- **Read path (Query side)**: `REST API → PostgreSQL (Gold layer / trip_clusters)` — optimized for low-latency geospatial queries via pre-aggregated tables and GiST indexes.
+
+The two paths never share a code path and scale independently: write throughput is governed by Kafka partitions and Spark workers; read throughput is governed by PostgreSQL connection pooling and read replicas. A formal CQRS implementation would introduce explicit read-model synchronization contracts and eventual-consistency visibility guarantees for clients. That is unnecessary here because the access pattern is simple (queries by region and week), the consistency window is already defined by the Spark micro-batch interval, and there is no competing write/read contention on the same records.
+
 ---
 
 ## 3. How It Works End-to-End
@@ -154,21 +173,7 @@ At each pipeline transition, a status event is published to `ingestion.status`. 
 
 > Who uses the system and what does it interact with?
 
-```mermaid
-C4Context
-    title System Context — Trips Ingestion Platform
-
-    Person(client, "Client", "Data analyst or automated pipeline that uploads trip CSVs and queries results")
-
-    System(platform, "Trips Ingestion Platform", "Ingests, processes, and serves trip data with spatial grouping and weekly metrics")
-
-    System_Ext(csv_source, "CSV Source", "Files containing raw trip records (origin, destination, datetime, datasource)")
-    System_Ext(bi_tool, "BI / Analytics Tool", "Connects to PostgreSQL to run SQL queries and build reports")
-
-    Rel(client, platform, "Uploads CSV, queries weekly averages, receives ingestion status", "HTTPS / SSE")
-    Rel(csv_source, client, "Provides CSV files")
-    Rel(platform, bi_tool, "Exposes SQL interface", "PostgreSQL wire protocol")
-```
+![Overall Flow](/docs/images/arch-img-c4-system-context.png)
 
 **There is one human actor** (the Client) and two external systems. The Client interacts with the platform exclusively via HTTPS and SSE — no direct database access is needed. The platform exposes PostgreSQL's wire protocol to BI tools, which means any SQL-capable tool (Tableau, Metabase, Superset, psql) can connect without any additional adapter. The CSV Source is intentionally external: the platform is agnostic to how CSVs are produced; it only cares about receiving them via the upload endpoint.
 
@@ -176,34 +181,7 @@ C4Context
 
 > What are the deployable units and how do they communicate?
 
-```mermaid
-C4Container
-    title Container Diagram — Trips Ingestion Platform (Local / Docker Compose)
-
-    Person(client, "Client")
-
-    System_Boundary(platform, "Trips Ingestion Platform") {
-        Container(api, "REST API", "FastAPI + Uvicorn", "Receives CSV uploads, publishes Kafka events, exposes SSE status and query endpoints")
-        Container(kafka, "Message Broker", "Apache Kafka (KRaft)", "Holds trips.raw, trips.dlq, and ingestion.status topics")
-        Container(job1, "Spark Job 1", "PySpark Structured Streaming", "Consumes trips.raw, writes Bronze and Silver Delta tables")
-        Container(job2, "Spark Job 2", "PySpark Structured Streaming", "Reads Silver, produces Gold clusters, upserts into PostgreSQL")
-        ContainerDb(delta, "Delta Lake", "Local filesystem (Docker volume)", "Stores Bronze, Silver, Gold as Delta tables with ACID guarantees")
-        ContainerDb(postgres, "PostgreSQL + PostGIS", "PostgreSQL 15 + PostGIS 3", "Serves SQL queries with spatial indexes (GiST) and geometry columns")
-        Container(airflow, "Orchestrator", "Apache Airflow 2 (LocalExecutor)", "Submits, monitors, and restarts Spark streaming jobs")
-    }
-
-    Rel(client, api, "POST /ingestions, GET /ingestions/{id}/status", "HTTPS / SSE")
-    Rel(api, kafka, "Publish events to trips.raw and trips.dlq", "Kafka Producer")
-    Rel(kafka, api, "Consume ingestion.status events", "Kafka Consumer")
-    Rel(kafka, job1, "Consume trips.raw", "Kafka Consumer (Structured Streaming)")
-    Rel(job1, delta, "Write Bronze + Silver", "Delta Lake API")
-    Rel(job1, kafka, "Publish ingestion.status", "Kafka Producer")
-    Rel(delta, job2, "Read Silver micro-batches", "Delta Lake API")
-    Rel(job2, postgres, "Upsert trips + trip_clusters", "JDBC")
-    Rel(job2, kafka, "Publish ingestion.status", "Kafka Producer")
-    Rel(airflow, job1, "spark-submit + health check", "subprocess / REST")
-    Rel(airflow, job2, "spark-submit + health check", "subprocess / REST")
-```
+![Overall Flow](/docs/images/arch-img-c4-container.png)
 
 **There are seven deployable units**, each running as a separate Docker container. Notice that Kafka appears in three roles simultaneously: it receives events from the API (`trips.raw`, `trips.dlq`), delivers them to Spark Job 1 for processing, and carries status events back to the API (`ingestion.status`). This makes Kafka the **central nervous system** of the platform — every cross-container communication passes through it, which is why no container directly calls another's HTTP API. The only exceptions are Airflow (which uses `spark-submit` to start Spark jobs) and Spark Job 2 (which writes to PostgreSQL via JDBC). Delta Lake is the hand-off point between the two Spark jobs: Job 1 writes Silver, Job 2 reads Silver — they never communicate directly. This design means each job can fail and recover independently without affecting the other.
 
@@ -211,27 +189,7 @@ C4Container
 
 > What are the internal components of the API container?
 
-```mermaid
-C4Component
-    title Component Diagram — REST API (FastAPI)
-
-    Container_Boundary(api, "REST API") {
-        Component(router, "Ingestion Router", "FastAPI Router", "Handles POST /ingestions and GET /ingestions/{id}/status")
-        Component(query_router, "Query Router", "FastAPI Router", "Handles GET /weekly-averages and GET /clusters")
-        Component(csv_parser, "CSV Parser", "Python / domain layer", "Parses and validates CSV rows, builds TripEvent domain objects")
-        Component(publisher, "Kafka Publisher", "aiokafka Producer", "Publishes TripEvent and status events to Kafka topics")
-        Component(sse_handler, "SSE Handler", "FastAPI StreamingResponse", "Subscribes to ingestion.status and streams events to client")
-        Component(query_svc, "Query Service", "SQLAlchemy + PostGIS", "Executes weekly average and bounding box queries against PostgreSQL")
-        Component(domain, "Domain", "Pure Python", "Trip, Ingestion, Region, Datasource entities and validation rules")
-    }
-
-    Rel(router, csv_parser, "Parse uploaded CSV")
-    Rel(csv_parser, domain, "Validate and construct TripEvent")
-    Rel(router, publisher, "Publish events to trips.raw")
-    Rel(router, sse_handler, "Register SSE listener for ingestion_id")
-    Rel(sse_handler, publisher, "Subscribe to ingestion.status")
-    Rel(query_router, query_svc, "Execute analytical queries")
-```
+![Overall Flow](/docs/images/arch-img-c4-component-rest-api.png)
 
 **The API has six internal components** split across two logical paths. The **ingestion path** (left side) handles uploads: the Ingestion Router delegates to the CSV Parser, which validates each row against the Domain entities and forwards the resulting `TripEvent` objects to the Kafka Publisher. The **status path** (crossing both sides) works in reverse: the SSE Handler subscribes to `ingestion.status` via the Kafka Publisher and streams each received event to the waiting client. The **query path** (right side) is stateless: the Query Router calls the Query Service, which executes PostGIS SQL and returns results directly. Crucially, the **Domain component has no outbound arrows** — it depends on nothing outside itself. This is the Clean Architecture boundary: business rules (what makes a trip valid, how `trip_id` is computed) live in pure Python with no Kafka or database imports, making them independently testable.
 
@@ -239,28 +197,20 @@ C4Component
 
 > What happens inside the most critical streaming job — the one that determines data quality?
 
-```mermaid
-C4Component
-    title Component Diagram — Spark Job 1 (Kafka → Bronze + Silver)
+![Overall Flow](/docs/images/arch-img-c4-spark-job-1.png)
 
-    Container_Boundary(job1, "Spark Job 1") {
-        Component(source, "Kafka Source", "Structured Streaming readStream", "Consumes trips.raw with at-least-once semantics")
-        Component(bronze_writer, "Bronze Writer", "Delta Lake foreachBatch", "Writes raw payloads to delta://bronze/trips partitioned by ingestion_date")
-        Component(validator, "Row Validator", "PySpark UDFs / domain rules", "Validates types, coordinate ranges, datetime format; routes invalid rows to DLQ sink")
-        Component(dedup, "Deduplicator", "dropDuplicates + watermark", "Deduplicates by trip_id within a 24-hour watermark window")
-        Component(silver_writer, "Silver Writer", "Delta Lake foreachBatch", "Writes clean records to delta://silver/trips partitioned by region and ingestion_date")
-        Component(status_pub, "Status Publisher", "Kafka Producer", "Emits ingestion.status events at each processing milestone")
-    }
-
-    Rel(source, bronze_writer, "Raw micro-batch")
-    Rel(source, validator, "Raw micro-batch")
-    Rel(validator, dedup, "Valid rows")
-    Rel(validator, status_pub, "DLQ row count → PARTIAL_FAILURE event")
-    Rel(dedup, silver_writer, "Deduplicated rows")
-    Rel(silver_writer, status_pub, "SILVER_COMPLETED event")
-```
 
 **The Kafka Source fans out into two parallel paths in every micro-batch.** The Bronze Writer receives the raw, untouched micro-batch first — before any validation — ensuring that even records that will later be rejected are preserved in the audit layer. Simultaneously, the Row Validator applies domain rules (coordinate ranges, datetime format, required fields) and splits the batch: invalid rows go to the Dead Letter Queue topic, valid rows proceed to the Deduplicator. The Deduplicator uses Spark's `dropDuplicates` combined with a watermark window to handle late-arriving or repeated events across micro-batches — critical for idempotent re-ingestion. Only after deduplication does the Silver Writer commit clean records to Delta Lake. At each of these transitions, the Status Publisher emits a Kafka event, providing the fine-grained progress updates that drive the client's SSE stream.
+
+### 4.5 Level 3 — Component Diagram (Spark Job 2)
+
+> What happens inside the aggregation job — the one that transforms clean trip records into queryable insights?
+
+![Spark Job 2](/docs/images/arch-img-c4-spark-job-2.png)
+
+**The Silver Reader is the single entry point: Job 2 never touches Kafka directly.** It continuously reads new micro-batches from the Silver Delta table using Structured Streaming's change-data-capture mechanism — only records committed by Job 1 since the last checkpoint are processed, ensuring the two jobs are fully decoupled and independently restartable. Each incoming record passes through the **Geohash Encoder**, which converts the raw lon/lat coordinates into a Geohash-7 string (one cell ≈ 150m × 150m) for both origin and destination. Simultaneously, the **Time Bucketer** truncates the trip datetime to the nearest 30-minute boundary, producing a normalized `time_bucket` value. These two enrichments are computed in the same Spark transformation step with no I/O cost.
+
+The enriched records flow into the **Cluster Aggregator**, which groups trips by the composite key `(origin_cell, destination_cell, time_bucket, iso_week)` and increments the cluster trip count. This is the core of the similarity grouping logic: two trips that share the same composite key are considered spatially and temporally similar. From the Cluster Aggregator, two parallel write paths diverge. The **Trip Writer** upserts individual trip records — including PostGIS `POINT` geometry columns — into the `trips` table, using `trip_id` as the conflict key to enforce idempotency. The **Cluster Writer** upserts the aggregated cluster counts into the `trip_clusters` table, applying an `ON CONFLICT DO UPDATE` strategy so that repeated micro-batches accumulate counts rather than duplicating rows. Both writers use batched JDBC inserts (configurable batch size, e.g., 5,000 rows) to minimize round-trips to PostgreSQL. Finally, the **Status Publisher** emits `GOLD_STARTED`, `GOLD_COMPLETED`, and `FAILED` events to the `ingestion.status` Kafka topic, closing the feedback loop that drives the client's SSE stream.
 
 ---
 
@@ -519,13 +469,15 @@ Pre-aggregating cluster counts in a dedicated table reduces the weekly average q
 | Local filesystem for Delta Lake | No distributed storage | Acceptable for local demo; production uses S3 or Azure Data Lake |
 | Airflow `LocalExecutor` | No distributed task execution | Acceptable for local demo; production uses `CeleryExecutor` or MWAA |
 | No TLS on Kafka or PostgreSQL | Security gap | Local only; production enforces TLS and IAM/SCRAM authentication |
+| `PUBLISH_DELAY_SECONDS=0.5` — intentional publish throttle | The API pauses 0.5 s between each Kafka event. For 100 rows this adds 50 s of artificial latency before Spark even starts processing. | Demo-only setting to make streaming behaviour visible in real time. Set to `0` in production. |
+| `maxFilesPerTrigger=1` — intentional micro-batch throttle on Job 2 | Job 2 processes 1 Silver Parquet file per 5-second trigger, making progress visible as PostgreSQL counts grow one batch at a time (~10 min total for 100 rows). | Remove `maxFilesPerTrigger` in production; Spark will process all available files per trigger. |
 
 ### 7.3 Why This Complexity for a 100-Row Sample?
 
 The 100-row sample (`trips.csv`) is trivially small. However, the challenge explicitly asks for a **solution scalable to 100 million records**. A solution that only works at small scale (e.g., pandas + SQLite) fails the scalability requirement. The architecture was designed to demonstrate:
 
 1. **Correct abstractions** that scale horizontally without code changes
-2. **Industry-standard patterns** (medallion architecture, event sourcing, geospatial indexing) that are expected in production data engineering
+2. **Industry-standard patterns** (medallion architecture, adapted CQRS and Event Sourcing — see [Section 2.4](#24-architectural-patterns-adapted-cqrs-and-event-sourcing), geospatial indexing) that are expected in production data engineering
 3. **Migration readiness**: every local component maps 1:1 to a managed cloud service
 
 The "overhead" of Kafka, Spark, and Delta Lake for 100 rows is intentional — it proves the architecture works at that level, and the same code handles 100M with infrastructure changes only.
@@ -536,124 +488,40 @@ The "overhead" of Kafka, Spark, and Delta Lake for 100 rows is intentional — i
 
 ### 8.1 Design Philosophy
 
-The cloud architecture follows the same logical design as the local version. Each local component is replaced by its managed AWS or Databricks equivalent:
+The cloud architecture is not a 1:1 lift-and-shift of the local setup. Instead, it is a **Databricks-first design**: Databricks is the control plane for processing, orchestration, governance, and analytical serving. AWS provides the infrastructure primitives (networking, managed Kafka, object storage, relational database). This distinction matters because replicating local components directly to cloud equivalents often introduces unnecessary services — the clearest example being MWAA, which costs ~$400–500/month at minimum and exists solely to orchestrate pipelines that Databricks Workflows already handles natively, at no additional cost.
 
-| Local Component | Cloud Equivalent | Reason for Replacement |
+The guiding principle for each component decision is: **use the Databricks-native solution when it fully covers the requirement; add an AWS-managed service only when Databricks cannot serve that role**.
+
+| Local Component | Cloud Equivalent | Design Rationale |
 |---|---|---|
-| Kafka (KRaft, single broker) | **Amazon MSK** (Managed Streaming for Kafka) | Fully managed, multi-AZ, auto-scaling, IAM auth |
-| Spark (local master/worker) | **Databricks on AWS** (autoscaling clusters) | Managed Spark, Delta Lake native, DLT, Unity Catalog |
-| Delta Lake (local volume) | **S3 + Databricks Delta Lake** | Durable, infinitely scalable, lifecycle policies |
-| PostgreSQL (Docker) | **Amazon RDS PostgreSQL + PostGIS** | Multi-AZ, auto-scaling storage, managed backups |
-| FastAPI (Docker) | **FastAPI on Amazon EKS** | Kubernetes-managed, horizontal pod autoscaling |
-| Airflow (Docker, LocalExecutor) | **Amazon MWAA** or **Databricks Workflows** | Managed orchestration, no infra to maintain |
-| Local network | **AWS VPC** (private subnets, security groups) | Network isolation, VPC endpoints for MSK/S3 |
+| Kafka (KRaft, single broker) | **Amazon MSK** (multi-AZ, replication factor 3) | Fully managed; Databricks has no managed Kafka offering. MSK integrates natively with VPC and IAM. |
+| Spark (local master/worker) | **Databricks on AWS** — DLT pipelines on autoscaling clusters | DLT, Unity Catalog, built-in quality rules, native Delta Lake — far beyond raw Spark. |
+| Delta Lake (local volume) | **S3 + Databricks Delta Lake** (Unity Catalog) | Infinitely scalable; Unity Catalog adds governance and lineage at no extra infrastructure cost. |
+| PostgreSQL (Docker) | **Amazon RDS PostgreSQL + PostGIS** | Required for the API's low-latency geospatial queries (ST_Within, GiST indexes). Databricks SQL does not expose a PostgreSQL wire protocol. |
+| Airflow (Docker, LocalExecutor) | **Databricks Workflows** | Native DLT orchestration, retries, SLA alerts, and dependency graphs — with zero additional service cost. MWAA is only justified when orchestrating non-Databricks systems. |
+| FastAPI (Docker) | **FastAPI on Amazon EKS** (HPA) | SSE requires long-lived HTTP connections incompatible with Lambda. EKS provides horizontal autoscaling. |
+| BI access (none locally) | **Databricks SQL Warehouse** | Primary analytical interface for BI tools. Queries Gold Delta tables directly — no data copy needed. |
+| Local network | **AWS VPC** (private subnets, VPC endpoints) | All inter-service communication stays within the VPC; MSK, RDS, and S3 never traverse the public internet. |
 
 ### 8.2 Cloud Architecture Diagram (System Context)
 
-```mermaid
-C4Context
-    title Cloud System Context — Trips Platform on AWS
-
-    Person(client, "Client / Analyst", "Uploads CSVs, queries trip data, receives real-time status")
-
-    System(platform, "Trips Platform (AWS)", "Event-driven ingestion, Spark streaming on Databricks, PostGIS serving")
-
-    System_Ext(s3_raw, "Amazon S3 (raw uploads)", "Landing zone for CSV files (optional pre-stage)")
-    System_Ext(bi, "BI Tool (Tableau / Superset)", "Connects to RDS PostgreSQL or Databricks SQL Warehouse")
-    System_Ext(monitoring, "AWS CloudWatch + Databricks Observability", "Metrics, logs, alerts, SLA dashboards")
-
-    Rel(client, platform, "HTTPS uploads + SSE status + SQL queries")
-    Rel(platform, s3_raw, "Optional S3 staging for large files")
-    Rel(platform, bi, "SQL interface (PostgreSQL wire / JDBC)")
-    Rel(platform, monitoring, "Structured logs + metrics")
-```
+![Cloud System Context](/docs/images/arch-img-c4-cloud-system-context.png)
 
 **The cloud system context is structurally identical to the local one** — the same three external actors, the same interactions. The important additions are S3 as an optional pre-staging zone for very large uploads (bypassing the API's memory constraints) and a dedicated observability system. Monitoring is not optional at scale: at 100M records/day, silent failures or performance regressions are invisible without dashboards tracking MSK consumer lag, Spark job throughput, and API error rates. The fact that the context diagram is unchanged between local and cloud versions is by design — the system's external contract does not change when migrating to managed services.
 
 ### 8.3 Cloud Container Diagram
 
-```mermaid
-C4Container
-    title Cloud Container Diagram — AWS + Databricks
+![Cloud Container Diagram](/docs/images/arch-img-c4-cloud-container.png)
 
-    Person(client, "Client")
+**The key structural difference from the local architecture is the removal of MWAA and the promotion of Databricks Workflows to the primary orchestrator.** In the local version, Airflow makes sense as the orchestration layer because it monitors heterogeneous Docker containers with no native dependency awareness. In the cloud, the entire processing stack lives inside Databricks: when both DLT pipelines and their orchestrator are Databricks-native, adding MWAA creates a cross-system dependency with non-trivial cost (MWAA's minimum charge is ~$400–500/month for the managed environment alone) and no functional benefit for this workload.
 
-    System_Boundary(aws, "AWS Account") {
-        Container(alb, "AWS ALB", "Application Load Balancer", "TLS termination, routing to EKS pods")
-        Container(api, "REST API", "FastAPI on EKS (HPA)", "Ingestion, SSE status, query endpoints. Scales from 1 to N pods.")
-        Container(msk, "Amazon MSK", "Apache Kafka (multi-AZ)", "topics: trips.raw, trips.dlq, ingestion.status. Replication factor 3.")
+**Databricks Workflows** handles everything MWAA would do for this pipeline: it triggers DLT pipelines via native API calls (not external REST calls), tracks run history, enforces inter-pipeline dependencies (Gold starts only after Silver completes successfully), sends failure alerts via Slack or PagerDuty webhooks, and exposes a visual DAG UI — all included in the Databricks subscription. The only scenario where MWAA remains justified is when the orchestration scope extends to non-Databricks systems (e.g., triggering RDS schema migrations, calling external APIs, orchestrating EKS Jobs). For this pipeline, that scenario does not apply.
 
-        System_Boundary(databricks, "Databricks Workspace (AWS)") {
-            Container(dlt_bronze_silver, "DLT Pipeline: Bronze + Silver", "Delta Live Tables", "Declarative streaming pipeline from MSK → Bronze → Silver with built-in quality rules and lineage")
-            Container(dlt_gold, "DLT Pipeline: Gold", "Delta Live Tables", "Silver → trip_clusters → weekly metrics. Writes final output to RDS.")
-            Container(unity, "Unity Catalog", "Databricks Unity Catalog", "Governance, lineage, access control, data discovery across all Delta tables")
-            ContainerDb(s3_delta, "Delta Lake on S3", "S3 + Databricks Runtime", "Bronze, Silver, Gold tables. Partitioned, Z-Ordered. Lifecycle: Bronze 90d, Silver/Gold indefinite.")
-        }
-
-        ContainerDb(rds, "Amazon RDS PostgreSQL + PostGIS", "Multi-AZ, db.r6g.large+", "trips, trip_clusters, regions, datasources. GiST spatial indexes.")
-        Container(mwaa, "Amazon MWAA", "Managed Apache Airflow", "Orchestrates DLT pipelines, monitors SLAs, triggers reprocessing on failure")
-        Container(cloudwatch, "CloudWatch + Grafana", "Observability stack", "MSK lag, Spark metrics, API latency, error rates, SLA alerts")
-    }
-
-    Rel(client, alb, "HTTPS / SSE", "TLS 1.3")
-    Rel(alb, api, "Route to EKS pod")
-    Rel(api, msk, "Produce to trips.raw + trips.dlq", "Kafka Producer, IAM auth")
-    Rel(msk, api, "Consume ingestion.status", "Kafka Consumer")
-    Rel(msk, dlt_bronze_silver, "Consume trips.raw", "Structured Streaming, IAM auth")
-    Rel(dlt_bronze_silver, s3_delta, "Write Bronze + Silver Delta tables")
-    Rel(dlt_bronze_silver, msk, "Publish ingestion.status")
-    Rel(s3_delta, dlt_gold, "Read Silver micro-batches")
-    Rel(dlt_gold, rds, "Upsert trips + trip_clusters", "JDBC over VPC")
-    Rel(dlt_gold, msk, "Publish ingestion.status")
-    Rel(mwaa, dlt_bronze_silver, "Trigger + monitor DLT pipeline", "Databricks REST API")
-    Rel(mwaa, dlt_gold, "Trigger + monitor DLT pipeline", "Databricks REST API")
-    Rel(unity, s3_delta, "Govern Delta tables")
-    Rel(databricks, cloudwatch, "Export metrics + logs")
-    Rel(api, cloudwatch, "Structured logs")
-```
-
-**The cloud container diagram shows the same logical components as the local version, each replaced by its managed equivalent.** The most significant structural change is the introduction of the **AWS ALB** in front of the API — the local version has no load balancer because a single container is sufficient. In production, the ALB distributes requests across multiple EKS pods and handles TLS termination, so the API pods never need to manage certificates. Inside the Databricks boundary, **Unity Catalog** is a cross-cutting concern: it governs all Delta tables regardless of which pipeline writes them, providing a single lineage graph from raw Kafka events to aggregated clusters. The **MWAA** orchestrator sits outside the Databricks boundary deliberately — it orchestrates not just Databricks pipelines but also database migrations, health checks, and other cross-system tasks that a Databricks-only scheduler could not handle. All containers emit logs and metrics to CloudWatch, enabling a single observability pane across both the AWS-managed and Databricks-managed layers.
+**The serving layer is split by access pattern.** The **Databricks SQL Warehouse** serves BI tools and analysts: it queries the Gold Delta table directly on S3 via serverless SQL, with no data movement. This eliminates any need to push analytical data to RDS just for BI queries. **RDS PostgreSQL + PostGIS** serves the REST API's low-latency endpoints — bounding box queries (ST_Within + GiST index) and weekly average lookups — where Databricks SQL Warehouse's cold-start latency (~2–3s for serverless) would be unacceptable for an interactive API response. The **Unity Catalog** remains the cross-cutting governance layer regardless of whether data is accessed via Databricks SQL or directly from the DLT pipeline.
 
 ### 8.4 Scaling to 100M Records on AWS
 
-```mermaid
-flowchart TD
-    subgraph Ingestion["Ingestion Tier (horizontal)"]
-        alb["ALB\n(multi-AZ)"]
-        api1["API Pod 1"]
-        api2["API Pod 2"]
-        apiN["API Pod N\n(HPA)"]
-        alb --> api1 & api2 & apiN
-    end
-
-    subgraph Kafka["MSK (multi-AZ, partitioned)"]
-        t1["trips.raw\n12 partitions"]
-        t2["ingestion.status\n6 partitions"]
-        t3["trips.dlq\n3 partitions"]
-    end
-
-    subgraph Databricks["Databricks (autoscaling clusters)"]
-        job1["DLT Bronze+Silver\n8–32 workers\nautoscale"]
-        job2["DLT Gold\n4–16 workers\nautoscale"]
-    end
-
-    subgraph Storage["S3 Delta Lake"]
-        b["Bronze\npartitioned by date"]
-        s["Silver\npartitioned by region+date\nZ-Order by datetime"]
-        g["Gold\ntrip_clusters\naggregated"]
-    end
-
-    subgraph Serving["Serving Tier"]
-        rds["RDS PostgreSQL\nMulti-AZ Read Replica\nPartitioned by month"]
-        dw["Databricks SQL\nWarehouse\n(optional)"]
-    end
-
-    api1 & api2 & apiN --> t1
-    t1 --> job1
-    job1 --> b & s
-    s --> job2
-    job2 --> g & rds & dw
-```
+![Scaling to 100M records on AWS](/docs/images/arch-img-scaling-100M-records-aws.png)
 
 **This diagram answers the scalability question concretely.** Each tier scales independently and in the same direction: horizontally. The ALB distributes upload traffic across as many API pods as Kubernetes HPA provisions — there is no per-node state in the API, so adding pods is frictionless. Those pods publish to MSK with 12 partitions, meaning up to 12 consumers can process in parallel simultaneously. Databricks autoscaling watches the MSK consumer lag metric: when lag grows (more events arriving than being processed), the cluster adds workers; when lag shrinks, it removes them. This elasticity is the key to handling unpredictable bursts — the system absorbs a sudden 10× load spike by scaling out within minutes, then scales back to save cost once the burst subsides. The S3 Delta Lake layer is effectively unbounded in capacity; it never becomes a bottleneck. RDS becomes the final potential bottleneck at extreme scale, which is addressed by the read replica (queries go to the replica, writes go to the primary) and monthly table partitioning.
 
@@ -721,9 +589,27 @@ All Delta tables (Bronze, Silver, Gold) are registered in Unity Catalog, providi
 - Automatic data lineage (Gold → Silver → Bronze → Kafka → API)
 - Centralized auditing for compliance
 
+**Databricks Workflows (replacing Airflow/MWAA)**
+
+Databricks Workflows orchestrates DLT pipelines natively without an external service:
+
+```
+DLT Bronze+Silver  ──► success?
+                         │ yes → trigger DLT Gold
+                         │ no  → retry (configurable backoff) → alert on Slack/PagerDuty
+```
+
+Key capabilities:
+- **Native DLT integration**: no REST calls to an external orchestrator; pipeline state is shared in-process
+- **Inter-pipeline dependencies**: Gold pipeline is gated on Silver completing without errors in the same run
+- **Retry policies**: exponential backoff with configurable max attempts per task
+- **SLA monitoring**: alert if a pipeline run exceeds a defined duration threshold
+- **Run history and lineage**: each run logs input data intervals, output row counts, and quality rule violations — accessible from the same UI as Unity Catalog lineage
+- **Zero additional cost**: included in the Databricks workspace; MWAA costs ~$400–500/month at minimum just for the managed environment
+
 **Autoscaling clusters**
 
-Databricks clusters scale from a minimum to a maximum number of workers based on queue depth, eliminating the need to provision for peak load permanently.
+Databricks clusters scale from a minimum to a maximum number of workers based on MSK consumer lag, eliminating the need to provision for peak load permanently. DLT pipelines inherit autoscaling by default — no configuration needed beyond setting `min_workers` and `max_workers`.
 
 ---
 
@@ -733,10 +619,11 @@ Databricks clusters scale from a minimum to a maximum number of workers based on
 
 | Decision | Alternative(s) | Rationale |
 |---|---|---|
-| **Databricks over EMR** | Amazon EMR with Spark | Databricks offers DLT, Unity Catalog, and superior Delta Lake integration. EMR is cheaper for steady-state workloads but requires more operational effort. For a data engineering showcase, Databricks is the stronger choice. |
+| **Databricks over EMR** | Amazon EMR with Spark | Databricks offers DLT, Unity Catalog, Workflows, and superior Delta Lake integration. EMR is cheaper for steady-state workloads but requires more operational effort. For a data engineering showcase, Databricks is the stronger choice. |
 | **MSK over Confluent Cloud** | Confluent Cloud Kafka, Kinesis | MSK stays within the AWS ecosystem (VPC, IAM, CloudWatch). Kinesis is simpler but lacks Kafka's ecosystem (connectors, client libraries). Confluent Cloud is excellent but adds a third-party dependency and cost. |
-| **RDS PostgreSQL + PostGIS** | Redshift, Aurora PostgreSQL | Redshift lacks native PostGIS; geospatial queries would require custom code. Aurora PostgreSQL supports PostGIS but at higher cost. Standard RDS with PostGIS is the lowest-complexity SQL + geospatial option. |
-| **MWAA over Databricks Workflows** | Databricks Workflows, Step Functions | MWAA provides a familiar Airflow interface and direct migration from the local Airflow setup. Databricks Workflows is simpler for Databricks-only pipelines. MWAA is preferred when cross-system orchestration (API health checks, RDS migrations) is needed. |
+| **Databricks Workflows over MWAA** | Amazon MWAA, AWS Step Functions | Databricks Workflows orchestrates DLT pipelines natively, with zero additional infrastructure cost. MWAA adds ~$400–500/month and requires managing DAG files, dependencies, and a separate service — justified only when orchestrating non-Databricks systems. This pipeline is entirely Databricks-internal. |
+| **Split serving: RDS for API + Databricks SQL for BI** | RDS-only, Databricks SQL-only | Databricks SQL Warehouse has serverless cold-start latency (~2–3s) unsuitable for interactive API responses. RDS + PostGIS handles low-latency geospatial queries. Databricks SQL Warehouse eliminates the need to push aggregated data to RDS for BI tools — they query Gold Delta tables directly. |
+| **RDS PostgreSQL + PostGIS (API serving)** | Redshift, Aurora PostgreSQL | Redshift lacks native PostGIS. Aurora PostgreSQL supports PostGIS but at higher cost. Standard RDS with PostGIS is the lowest-complexity option for the API's ST_Within and weekly average queries. |
 | **EKS for the API** | ECS Fargate, Lambda | Lambda has a 15-minute timeout, incompatible with long-running SSE connections. ECS Fargate is simpler but has less ecosystem maturity. EKS provides the most flexibility for HPA, service mesh, and zero-downtime deployments. |
 | **S3 for Delta Lake storage** | EFS, EBS | S3 is infinitely scalable, durable (11 nines), and cost-effective. EFS/EBS are block storage — not optimized for columnar analytical workloads. |
 
@@ -744,40 +631,17 @@ Databricks clusters scale from a minimum to a maximum number of workers based on
 
 | Scenario | Recommended configuration | Estimated monthly cost |
 |---|---|---|
-| **Development / staging** | 1 MSK broker, Databricks single-node cluster, db.t3.medium RDS, 1 EKS node | ~$200–400/month |
-| **Production (moderate load, ~1M rec/day)** | MSK 3-broker cluster, Databricks 4–8 workers autoscale, db.r6g.large RDS Multi-AZ, 3 EKS nodes | ~$1,500–2,500/month |
-| **Production (peak load, ~100M rec/day)** | MSK 6-broker cluster, Databricks 16–32 workers autoscale, db.r6g.2xlarge RDS + read replica, 5+ EKS nodes | ~$5,000–10,000/month |
+| **Development / staging** | 1 MSK broker, Databricks single-node cluster, db.t3.medium RDS, 1 EKS node, Databricks SQL Serverless | ~$150–300/month |
+| **Production (moderate load, ~1M rec/day)** | MSK 3-broker cluster, Databricks 4–8 workers autoscale, db.r6g.large RDS + automated backups + PITR, 3 EKS nodes, Databricks SQL Serverless | ~$1,000–2,000/month |
+| **Production (peak load, ~100M rec/day)** | MSK 6-broker cluster, Databricks 16–32 workers autoscale, db.r6g.2xlarge RDS + read replica, 5+ EKS nodes, Databricks SQL Pro Warehouse | ~$4,500–9,000/month |
 
-*Estimates based on us-east-1 pricing, March 2026. Databricks DBU cost dominates.*
+*Estimates based on us-east-1 pricing, March 2026. Databricks DBU cost dominates. Databricks Workflows is included in the workspace subscription — no line item. Removing MWAA saves ~$400–500/month at every tier.*
 
 ### 9.3 Failure Modes and Mitigations
 
-```mermaid
-flowchart LR
-    subgraph Failures["Failure Scenarios"]
-        f1["API pod crash"]
-        f2["MSK broker failure"]
-        f3["Spark job failure\n(mid-batch)"]
-        f4["RDS failover"]
-        f5["S3 outage"]
-    end
+![Failure Modes and Mitigations](/docs/images/arch-img-failure-modes-mitigations-aws.png)
 
-    subgraph Mitigations["Mitigations"]
-        m1["Kubernetes pod restart\n+ HPA respawns"]
-        m2["MSK multi-AZ\nreplication factor 3\nautomatc leader election"]
-        m3["Structured Streaming checkpoint\non S3 → resume from\nlast committed offset"]
-        m4["Multi-AZ RDS\nauto-failover < 60s\nread replica for queries"]
-        m5["S3 99.999999999%\ndurability. Regional HA.\nMulti-region replication\nfor DR."]
-    end
-
-    f1 --> m1
-    f2 --> m2
-    f3 --> m3
-    f4 --> m4
-    f5 --> m5
-```
-
-**Every failure mode has a mitigation that requires zero manual intervention.** This is the operational requirement that distinguishes a production architecture from a demo: the system must recover automatically even when an engineer is not watching. API pod crashes are handled by Kubernetes, which restarts the pod and optionally scales up to maintain capacity. MSK broker failures are handled by Kafka's own replication — with replication factor 3, the cluster survives the loss of any single broker without data loss. The most nuanced case is a Spark job failure mid-batch: Structured Streaming writes a **checkpoint** to S3 after each successfully committed micro-batch. When Airflow restarts the job, Spark reads the checkpoint and resumes from exactly the last committed Kafka offset — no records are lost or double-processed. RDS Multi-AZ failover is automatic and transparent to the application (the JDBC connection string resolves to the new primary). S3 is the only component that has no realistic failure scenario at the regional level; the concern for S3 is cross-region disaster recovery, which is addressed by replication policies rather than application-level mitigations.
+**Every failure mode has a mitigation that requires zero manual intervention.** This is the operational requirement that distinguishes a production architecture from a demo: the system must recover automatically even when an engineer is not watching. API pod crashes are handled by Kubernetes, which restarts the pod and optionally scales up to maintain capacity. MSK broker failures are handled by Kafka's own replication — with replication factor 3, the cluster survives the loss of any single broker without data loss. The most nuanced case is a Spark job failure mid-batch: Structured Streaming writes a **checkpoint** to S3 after each successfully committed micro-batch. When Airflow restarts the job, Spark reads the checkpoint and resumes from exactly the last committed Kafka offset — no records are lost or double-processed. RDS failure is mitigated by automated backups, point-in-time recovery (PITR), and — at peak load — read replicas that distribute query pressure and can be promoted to primary if needed; Multi-AZ is reserved for workloads where even a few minutes of downtime is unacceptable and the cost is justified by strict SLA requirements. S3 is the only component that has no realistic failure scenario at the regional level; the concern for S3 is cross-region disaster recovery, which is addressed by replication policies rather than application-level mitigations.
 
 ---
 
@@ -801,18 +665,19 @@ The architecture scales from the 100-row sample to 100 million records through *
 
 ### The Cloud Path
 
-The local architecture is a direct mirror of the cloud architecture. Each component maps to a managed AWS service:
+The local architecture provides a runnable proof-of-concept. The cloud architecture is not a 1:1 lift-and-shift — it is a **Databricks-first redesign** where Databricks owns processing, orchestration, and analytical serving:
 
 ```
-Local Kafka        →  Amazon MSK
-Local Spark        →  Databricks autoscaling clusters
-Local Delta Lake   →  Delta Lake on S3 (with Unity Catalog)
-Local PostgreSQL   →  Amazon RDS PostgreSQL + PostGIS (Multi-AZ)
-Local Airflow      →  Amazon MWAA or Databricks Workflows
-Local FastAPI      →  FastAPI on Amazon EKS (with HPA)
+Local Kafka          →  Amazon MSK (multi-AZ, IAM auth)
+Local Spark          →  Databricks DLT Pipelines (autoscaling)
+Local Delta Lake     →  Delta Lake on S3 + Unity Catalog
+Local Airflow        →  Databricks Workflows (native, zero added cost)
+Local PostgreSQL     →  RDS PostgreSQL + PostGIS (API serving only)
+                     +  Databricks SQL Warehouse (BI / analytical serving)
+Local FastAPI        →  FastAPI on Amazon EKS (HPA)
 ```
 
-This means the local demo is not a "toy prototype" — it is the cloud architecture running locally with Docker Compose replacing managed services. Migration to production is an infrastructure change, not an architectural redesign.
+The key insight is that the local Airflow + Spark + Delta Lake triad collapses into a single Databricks primitive (DLT + Workflows + Unity Catalog) in the cloud. Migration to production is primarily an infrastructure change; the only significant architectural addition is the split serving layer (RDS for the API, Databricks SQL for BI).
 
 ### Design Principles Applied
 
@@ -829,8 +694,3 @@ This means the local demo is not a "toy prototype" — it is the cloud architect
 The challenge asked for a solution that "simplifies the data by a data model" and provides "proof of scalability." The answer to both is the **trip_clusters Gold table**: it reduces query cost from O(100M rows) to O(weeks × regions × geohash cells), and the mathematical argument in Section 5.3 demonstrates why the architecture scales without code changes.
 
 The non-polling status requirement — often solved with polling disguised as "short polling" — is addressed properly here with an event-driven SSE stream backed by Kafka, which also serves as the coordination backbone for the entire pipeline.
-
----
-
-*This document was written as part of the Jobsity Data Engineering Interview Challenge.*
-*All architecture diagrams use the [Mermaid](https://mermaid.js.org/) diagramming language.*
