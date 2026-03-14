@@ -1,8 +1,7 @@
-version: "3.9"
-
 services:
   kafka:
-    image: bitnami/kafka:3.6
+    image: bitnamilegacy/kafka:4.0.0-debian-12-r10
+    platform: linux/amd64
     container_name: kafka
     environment:
       - KAFKA_CFG_NODE_ID=1
@@ -18,7 +17,8 @@ services:
       - "9092:9092"
 
   postgres:
-    image: postgis/postgis:15-3.4
+    image: postgis/postgis:17-3.5
+    platform: linux/amd64
     container_name: postgres
     environment:
       - POSTGRES_USER=trips
@@ -27,7 +27,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
       - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   api:
@@ -44,10 +44,15 @@ services:
       - kafka
 
   spark-master:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.1
+    platform: linux/amd64
     container_name: spark-master
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
     environment:
-      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
     ports:
       - "7077:7077"
       - "8080:8080"
@@ -56,11 +61,13 @@ services:
       - ./src:/opt/spark-apps
 
   spark-worker:
-    image: bitnami/spark:3.5
+    image: apache/spark:3.5.1
+    platform: linux/amd64
     container_name: spark-worker
-    environment:
-      - SPARK_MODE=worker
-      - SPARK_MASTER_URL=spark://spark-master:7077
+    command:
+      - "/opt/spark/bin/spark-class"
+      - "org.apache.spark.deploy.worker.Worker"
+      - "spark://spark-master:7077"
     depends_on:
       - spark-master
     volumes:
@@ -72,27 +79,47 @@ services:
       context: .
       dockerfile: docker/airflow.Dockerfile
     container_name: airflow-webserver
+    command: ["webserver"]
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://trips:trips@postgres:5432/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DEFAULT_TIMEZONE=America/Recife
+      - AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE=America/Recife
+      - DELTA_BASE_PATH=/opt/spark-data/delta
+      - CHECKPOINT_BASE_PATH=/opt/spark-data/checkpoints
     volumes:
+      - ./data/airflow:/opt/airflow
+      - ./data:/opt/spark-data
       - ./airflow/dags:/opt/airflow/dags
       - ./src:/opt/airflow/src
     ports:
       - "8081:8080"
+    depends_on:
+      - postgres
 
   airflow-scheduler:
     build:
       context: .
       dockerfile: docker/airflow.Dockerfile
     container_name: airflow-scheduler
+    command: ["scheduler"]
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://trips:trips@postgres:5432/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DEFAULT_TIMEZONE=America/Recife
+      - AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE=America/Recife
+      - DELTA_BASE_PATH=/opt/spark-data/delta
+      - CHECKPOINT_BASE_PATH=/opt/spark-data/checkpoints
     volumes:
+      - ./data/airflow:/opt/airflow
+      - ./data:/opt/spark-data
       - ./airflow/dags:/opt/airflow/dags
       - ./src:/opt/airflow/src
     depends_on:
       - airflow-webserver
+      - postgres
+
+volumes:
+  postgres_data:

@@ -27,13 +27,13 @@ TRIPS_TOPIC = os.getenv("TRIPS_TOPIC", "trips.raw")
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
 
 app = FastAPI(title="Jobsity DE Challenge")
+FastAPIInstrumentor.instrument_app(app)
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     configure_logging()
     LoggingInstrumentor().instrument(set_logging_format=True)
-    FastAPIInstrumentor.instrument_app(app)
 
 
 @app.get("/healthz")

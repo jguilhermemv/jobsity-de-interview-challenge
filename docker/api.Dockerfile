@@ -3,9 +3,10 @@ FROM python:3.11-slim
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
-RUN pip install --no-cache-dir poetry \
+RUN pip install --no-cache-dir poetry setuptools \
     && poetry config virtualenvs.create false \
-    && poetry install --no-interaction --no-ansi --only main
+    && poetry install --no-interaction --no-ansi --only main --no-root \
+    && pip install --no-cache-dir "setuptools<81"
 
 COPY src ./src
 

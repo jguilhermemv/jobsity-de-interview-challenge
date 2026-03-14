@@ -121,11 +121,12 @@ Based on the challenge requirements and data/software engineering best practices
 
 ## 5) Coordination with Airflow (local)
 
-- **DAG** with two `spark-submit` tasks (Job 1 and Job 2).
-- Jobs are **long-running**, so Airflow acts as **orchestrator/monitor**.
+- **DAG** with two `spark-submit` tasks (Job 1 and Job 2) running **in parallel**.
+- Jobs are **long-running**, so Airflow acts as **orchestrator/monitor** instead of sequencing.
+- Airflow metadata uses **Postgres** and `LocalExecutor` for concurrent task execution.
 - On failure, Airflow restarts the job with checkpoints intact.
 
-**Rationale**: simulates enterprise workflows without relying on Databricks.
+**Rationale**: simulates enterprise workflows without relying on Databricks and avoids blocking streaming tasks.
 
 ## 6) Data model (SQL + spatial)
 
