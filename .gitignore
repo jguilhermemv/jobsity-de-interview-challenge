@@ -7,3 +7,4 @@ data/postgres/
 data/checkpoints/
 data/delta/
 logs/
+node_modules/
