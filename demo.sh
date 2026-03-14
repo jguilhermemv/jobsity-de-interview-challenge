@@ -74,7 +74,24 @@ for arg in "$@"; do
     --skip-build)  SKIP_BUILD=true   ;;
     --no-tests)    RUN_TESTS=false   ;;
     --help|-h)
-      head -50 "$0" | grep '^#[^!]' | sed 's/^# \{0,2\}//'
+      echo "Usage: bash demo.sh [OPTIONS]"
+      echo ""
+      echo "Full end-to-end demo: CSV → FastAPI → Kafka → Spark → Delta Lake → PostgreSQL"
+      echo ""
+      echo "Options:"
+      echo "  --resume       Skip teardown/reset — reuse already-running containers"
+      echo "  --skip-build   Skip 'docker compose build' (images already built)"
+      echo "  --no-tests     Skip the pytest unit/contract test suite"
+      echo "  --help, -h     Show this help message and exit"
+      echo ""
+      echo "Approximate runtime:"
+      echo "  First run  (build + Maven download):  20–35 min"
+      echo "  Subsequent (--resume --skip-build):    5–10 min"
+      echo ""
+      echo "Examples:"
+      echo "  bash demo.sh                           # clean run from scratch"
+      echo "  bash demo.sh --resume --skip-build     # reuse containers, skip build"
+      echo "  bash demo.sh --no-tests --skip-build   # fast run without test suite"
       exit 0
       ;;
     *)
@@ -878,7 +895,8 @@ echo -e "   –     Deduplication (2nd upload)      ${GRN}✔${NC}  count unchan
 echo
 hr
 
-banner "Demo complete — data is flowing end-to-end"
+TOTAL_ELAPSED=$(elapsed)
+banner "Demo complete — total time: ${TOTAL_ELAPSED}"
 
 echo
 echo -e "  ${BOLD}Key engineering decisions demonstrated:${NC}"
