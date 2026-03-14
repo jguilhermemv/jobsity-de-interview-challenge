@@ -142,44 +142,7 @@ At each pipeline transition, a status event is published to `ingestion.status`. 
 
 ### 3.3 Ingestion Status Sequence
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant API as REST API
-    participant Kafka
-    participant Job1 as Spark Job 1
-    participant Job2 as Spark Job 2
-    participant PG as PostgreSQL
-
-    Client->>API: POST /ingestions (CSV)
-    API-->>Client: 202 Accepted {ingestion_id}
-    Client->>API: GET /ingestions/{id}/status (SSE)
-
-    API->>Kafka: trips.raw (N events)
-    API->>Kafka: ingestion.status = QUEUED
-
-    Kafka-->>Job1: consume trips.raw
-    Job1->>Kafka: ingestion.status = BRONZE_STARTED
-    Kafka-->>API: status event
-    API-->>Client: SSE: BRONZE_STARTED
-
-    Job1->>Job1: validate + deduplicate
-    Job1->>Kafka: ingestion.status = SILVER_COMPLETED
-    Kafka-->>API: status event
-    API-->>Client: SSE: SILVER_COMPLETED
-
-    Job2->>Job2: geohash + cluster
-    Job2->>PG: upsert trips + clusters
-    Job2->>Kafka: ingestion.status = COMPLETED
-    Kafka-->>API: status event
-    API-->>Client: SSE: COMPLETED
-
-    alt transient failure
-        Job1->>Kafka: ingestion.status = FAILED {retryable=true}
-        API-->>Client: SSE: FAILED (retryable)
-        Note over Job1: Airflow restarts with checkpoint
-    end
-```
+![Overall Flow](/docs/images/arch-img-ingestion-status-sequence.png)
 
 **Reading this diagram:** This sequence answers requirement R4 — *"inform the user about the status of data ingestion without using a polling solution."* The key insight is that the client opens a **single persistent HTTP connection** (`GET /ingestions/{id}/status`) immediately after receiving the `ingestion_id`. From that point, all status transitions are **pushed** to the client by the server. There is no repeated request; the client just listens. The Kafka `ingestion.status` topic is the coordination bus: every Spark job publishes an event at each milestone (`BRONZE_STARTED`, `SILVER_COMPLETED`, `COMPLETED`), and the API relays those events directly to the client's SSE stream. The `alt` block shows the failure path: even on error, the client receives a notification automatically — Airflow then restarts the job using its existing checkpoint, so processing resumes from exactly where it stopped rather than reprocessing from the beginning.
 
