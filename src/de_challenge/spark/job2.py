@@ -152,11 +152,16 @@ def run_job2() -> None:
     postgres_url = os.getenv("POSTGRES_URL", "jdbc:postgresql://postgres:5432/trips")
     postgres_user = os.getenv("POSTGRES_USER", "trips")
     postgres_password = os.getenv("POSTGRES_PASSWORD", "trips")
+    max_files = int(os.getenv("MAX_FILES_PER_TRIGGER", "1"))
 
     spark = build_spark("job2-gold-postgis")
 
     _wait_for_silver(f"{delta_base}/silver_trips")
-    silver = spark.readStream.format("delta").load(f"{delta_base}/silver_trips")
+    silver = (
+        spark.readStream.format("delta")
+        .option("maxFilesPerTrigger", max_files)
+        .load(f"{delta_base}/silver_trips")
+    )
 
     enriched = add_geohashes(silver, precision=7)
     enriched = add_time_bucket(enriched, minutes=30)
@@ -181,6 +186,7 @@ def run_job2() -> None:
         clusters.writeStream.format("delta")
         .option("checkpointLocation", f"{checkpoint_base}/gold_trip_clusters")
         .outputMode("complete")
+        .trigger(processingTime="5 seconds")
         .start(f"{delta_base}/gold_trip_clusters")
     )
 
@@ -189,6 +195,7 @@ def run_job2() -> None:
         weekly_metrics.writeStream.format("delta")
         .option("checkpointLocation", f"{checkpoint_base}/gold_weekly_metrics")
         .outputMode("complete")
+        .trigger(processingTime="5 seconds")
         .start(f"{delta_base}/gold_weekly_metrics")
     )
 
@@ -201,6 +208,7 @@ def run_job2() -> None:
         )
         .option("checkpointLocation", f"{checkpoint_base}/postgres_trips")
         .outputMode("append")
+        .trigger(processingTime="5 seconds")
         .start()
     )
 
@@ -213,6 +221,7 @@ def run_job2() -> None:
         )
         .option("checkpointLocation", f"{checkpoint_base}/postgres_trip_clusters")
         .outputMode("update")
+        .trigger(processingTime="5 seconds")
         .start()
     )
 

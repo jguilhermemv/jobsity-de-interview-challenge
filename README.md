@@ -9,6 +9,8 @@ Local, containerized data pipeline demonstrating Kafka ingestion, Spark Structur
 1. [Architecture](#architecture)
 2. [Is It Streaming or Batch?](#is-it-streaming-or-batch)
 3. [Quick Start](#quick-start)
+   - [Option A — One-command Demo](#option-a--one-command-demo-recommended)
+   - [Option B — Manual Step-by-step](#option-b--manual-step-by-step)
 4. [Reset and Reprocess from Scratch](#reset-and-reprocess-from-scratch)
 5. [Validate Each Pipeline Stage](#validate-each-pipeline-stage)
 6. [Connect to PostgreSQL via DBeaver](#connect-to-postgresql-via-dbeaver)
@@ -85,11 +87,37 @@ Spark Structured Streaming processes data in time windows (micro-batches), not r
 - Docker and Docker Compose installed
 - ~4 GB of RAM available for the containers
 
+### Option A — One-command Demo (recommended)
+
+```bash
+bash demo.sh
+```
+
+This single script runs the entire pipeline end-to-end: prerequisites check, clean reset, Docker build, infrastructure startup, Airflow initialisation, unit/contract tests, streaming pipeline trigger, CSV upload, stage-by-stage validation, deduplication test, and bonus queries.
+
+| Flag | Effect |
+|---|---|
+| `--resume` | Skip the teardown/reset step (containers already running) |
+| `--skip-build` | Skip `docker compose build` (images already built) |
+| `--no-tests` | Skip the pytest suite |
+
+**Estimated runtime**:
+- First run (build + Ivy/Maven download): **20–35 min**
+- Subsequent runs with `--resume`: **5–10 min**
+
+Progress and all command output are saved to `logs/demo_<timestamp>.log`.
+
+---
+
+### Option B — Manual Step-by-step
+
 ### 1. Set up environment variables
 
 ```bash
 cp .env.example .env
 ```
+
+The `.env.example` file ships with safe defaults for local development — all values map to the services defined in `docker-compose.yml`.
 
 ### 2. Start the full stack
 
@@ -524,9 +552,16 @@ Go to `http://localhost:8080` → click the active job's Application ID → **St
 
 ### PostgreSQL tables (database `trips`)
 
+Schema is initialised by `sql/init.sql` (run automatically by the `postgres` container on first start).
+
 | Table | Description |
 |---|---|
-| `trip_clusters` | Gold clusters: `origin_cell`, `destination_cell`, `time_bucket`, `trip_count`, `iso_week` |
+| `trip_clusters` | Gold clusters written by Spark Job 2: `origin_cell`, `destination_cell`, `time_bucket`, `trip_count`, `iso_week` |
+| `trips` | Individual trip records with PostGIS geometry columns (`origin_geom`, `destination_geom`) auto-populated by trigger |
+| `regions` | Lookup table kept in sync automatically via trigger on `trips` inserts |
+| `datasources` | Lookup table kept in sync automatically via trigger on `trips` inserts |
+
+> PostGIS geometry columns on the `trips` table are auto-populated from lon/lat values by a `BEFORE INSERT OR UPDATE` trigger — no geometry conversion needed from Spark.
 
 ### Kafka event schema (`trips.raw`)
 
@@ -600,7 +635,39 @@ poetry run mypy src/de_challenge/domain/ src/de_challenge/ingestion/
 
 ## Bonus Queries
 
-See `sql/bonus_queries.sql` for analytical queries against `trip_clusters`.
+Run these against the `trips` database (e.g. via `docker exec -it postgres psql -U trips -d trips`). The full file is at `sql/bonus_queries.sql`.
+
+### a) Of the two most frequent regions, what is the latest datasource?
+
+```sql
+WITH top_regions AS (
+  SELECT region, COUNT(*) AS trips
+  FROM trips
+  GROUP BY region
+  ORDER BY trips DESC
+  LIMIT 2
+), ranked AS (
+  SELECT
+    t.region,
+    t.datasource,
+    t.datetime,
+    ROW_NUMBER() OVER (PARTITION BY t.region ORDER BY t.datetime DESC) AS rn
+  FROM trips t
+  JOIN top_regions tr ON tr.region = t.region
+)
+SELECT region, datasource, datetime
+FROM ranked
+WHERE rn = 1;
+```
+
+### b) In which regions did the datasource "cheap_mobile" appear?
+
+```sql
+SELECT DISTINCT region
+FROM trips
+WHERE datasource = 'cheap_mobile'
+ORDER BY region;
+```
 
 ---
 

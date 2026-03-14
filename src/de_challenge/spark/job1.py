@@ -24,6 +24,7 @@ def run_job1() -> None:
     trips_topic = os.getenv("TRIPS_TOPIC", "trips.raw")
     delta_base = os.getenv("DELTA_BASE_PATH", "data/delta")
     checkpoint_base = os.getenv("CHECKPOINT_BASE_PATH", "data/checkpoints")
+    max_offsets = int(os.getenv("MAX_OFFSETS_PER_TRIGGER", "10"))
 
     spark = build_spark("job1-bronze-silver")
 
@@ -47,6 +48,7 @@ def run_job1() -> None:
         .option("kafka.bootstrap.servers", kafka_bootstrap)
         .option("subscribe", trips_topic)
         .option("startingOffsets", "earliest")
+        .option("maxOffsetsPerTrigger", max_offsets)
         .load()
     )
 
@@ -80,6 +82,7 @@ def run_job1() -> None:
         bronze.writeStream.format("delta")
         .option("checkpointLocation", f"{checkpoint_base}/bronze_trips")
         .outputMode("append")
+        .trigger(processingTime="5 seconds")
         .start(f"{delta_base}/bronze_trips")
     )
 
@@ -87,6 +90,7 @@ def run_job1() -> None:
         silver.writeStream.format("delta")
         .option("checkpointLocation", f"{checkpoint_base}/silver_trips")
         .outputMode("append")
+        .trigger(processingTime="5 seconds")
         .start(f"{delta_base}/silver_trips")
     )
 
@@ -94,6 +98,7 @@ def run_job1() -> None:
         rejected.writeStream.format("delta")
         .option("checkpointLocation", f"{checkpoint_base}/rejected_trips")
         .outputMode("append")
+        .trigger(processingTime="5 seconds")
         .start(f"{delta_base}/rejected_trips")
     )
 

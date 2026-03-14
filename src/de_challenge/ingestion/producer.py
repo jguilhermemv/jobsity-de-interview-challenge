@@ -16,4 +16,6 @@ class KafkaProducerWrapper:
 
     def send(self, topic: str, value: Mapping[str, Any], key: str | None = None) -> None:
         self._producer.send(topic, value=value, key=key)
+
+    def flush(self) -> None:
         self._producer.flush()

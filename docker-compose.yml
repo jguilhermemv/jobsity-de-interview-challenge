@@ -38,6 +38,7 @@ services:
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - TRIPS_TOPIC=trips.raw
+      - PUBLISH_DELAY_SECONDS=0.5
     ports:
       - "8000:8000"
     depends_on:
@@ -88,6 +89,8 @@ services:
       - AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE=America/Recife
       - DELTA_BASE_PATH=/opt/spark-data/delta
       - CHECKPOINT_BASE_PATH=/opt/spark-data/checkpoints
+      - MAX_OFFSETS_PER_TRIGGER=10
+      - MAX_FILES_PER_TRIGGER=1
     volumes:
       - ./data/airflow:/opt/airflow
       - ./data:/opt/spark-data
@@ -112,6 +115,8 @@ services:
       - AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE=America/Recife
       - DELTA_BASE_PATH=/opt/spark-data/delta
       - CHECKPOINT_BASE_PATH=/opt/spark-data/checkpoints
+      - MAX_OFFSETS_PER_TRIGGER=10
+      - MAX_FILES_PER_TRIGGER=1
     volumes:
       - ./data/airflow:/opt/airflow
       - ./data:/opt/spark-data

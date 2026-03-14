@@ -170,11 +170,14 @@ wait_for() {
   echo -e " ${GRN}ready${NC}  ${DIM}[+$(elapsed)]${NC}"
 }
 
-# watch_pg_counts <max_wait_seconds>
-# Refreshes PostgreSQL table counts in-place every 2 s until trips stabilizes
-# or max_wait is reached.  Uses ANSI cursor-up to overwrite previous output.
+# watch_pg_counts <max_wait_seconds> [expected_trips]
+# Refreshes PostgreSQL table counts in-place every 2 s.
+# If expected_trips is given, waits until trips >= expected_trips before
+# checking stability. Stability = unchanged for 4 consecutive checks (8s).
+# Uses ANSI cursor-up to overwrite previous output.
 watch_pg_counts() {
   local max_wait="${1:-120}"
+  local expected="${2:-0}"
   local interval=2
   local elapsed_w=0
   local prev_trips=-1
@@ -183,7 +186,11 @@ watch_pg_counts() {
   local first=true
 
   echo
-  echo -e "     ${BOLD}Live PostgreSQL counts${NC}  ${DIM}(refreshes every ${interval}s — stops when stable)${NC}"
+  if [[ "$expected" -gt 0 ]]; then
+    echo -e "     ${BOLD}Live PostgreSQL counts${NC}  ${DIM}(refreshes every ${interval}s — target: ${expected} trips)${NC}"
+  else
+    echo -e "     ${BOLD}Live PostgreSQL counts${NC}  ${DIM}(refreshes every ${interval}s — stops when stable)${NC}"
+  fi
   echo
 
   while true; do
@@ -193,27 +200,48 @@ watch_pg_counts() {
     local ds_n;       ds_n=$(pg "SELECT COUNT(*) FROM datasources;"        2>/dev/null | tr -d '[:space:]') || ds_n="?"
     local hms; hms=$(elapsed)
 
-    # On subsequent iterations move cursor up to overwrite previous output
     if ! $first; then
       printf '\033[%dA' $NLINES
     fi
     first=false
 
-    echo -e "\r\033[2K     ${CYN}trips            ${NC}  ${BOLD}${GRN}${trips_n}${NC}"
+    # Show progress indicator when expected count is known
+    local pct=""
+    if [[ "$expected" -gt 0 && "$trips_n" =~ ^[0-9]+$ ]]; then
+      pct="  ($(( trips_n * 100 / expected ))%)"
+    fi
+
+    echo -e "\r\033[2K     ${CYN}trips            ${NC}  ${BOLD}${GRN}${trips_n}${pct}${NC}"
     echo -e "\r\033[2K     ${CYN}trip_clusters    ${NC}  ${BOLD}${GRN}${clusters_n}${NC}"
     echo -e "\r\033[2K     ${CYN}regions          ${NC}  ${BOLD}${GRN}${regions_n}${NC}"
     echo -e "\r\033[2K     ${CYN}datasources      ${NC}  ${BOLD}${GRN}${ds_n}${NC}"
     echo -e "\r\033[2K"
     printf   "\r\033[2K     ${DIM}elapsed: +%s${NC}\n" "$hms"
 
-    # Stop once trips count has been unchanged for 3 consecutive checks
-    if [[ "$trips_n" =~ ^[0-9]+$ ]]; then
-      if [[ "$trips_n" -eq "$prev_trips" ]]; then
-        stable=$(( stable + 1 ))
-        if [[ $stable -ge 3 ]]; then
-          echo
-          ok "Counts stable (trips=${trips_n}) — Spark micro-batch complete"
-          return 0
+    # Stability logic:
+    #   - Skip while trips=0 (Job 2 hasn't written yet)
+    #   - Skip while trips < expected (still processing)
+    #   - Once trips >= expected (or no expected given and trips > 0):
+    #     declare stable after 4 unchanged checks (8s)
+    if [[ "$trips_n" =~ ^[0-9]+$ && "$trips_n" -gt 0 ]]; then
+      local ready=false
+      if [[ "$expected" -gt 0 ]]; then
+        [[ "$trips_n" -ge "$expected" ]] && ready=true
+      else
+        ready=true
+      fi
+
+      if $ready; then
+        if [[ "$trips_n" -eq "$prev_trips" ]]; then
+          stable=$(( stable + 1 ))
+          if [[ $stable -ge 4 ]]; then
+            echo
+            ok "Counts stable (trips=${trips_n}) — all rows processed"
+            return 0
+          fi
+        else
+          stable=0
+          prev_trips=$trips_n
         fi
       else
         stable=0
@@ -224,7 +252,7 @@ watch_pg_counts() {
     elapsed_w=$(( elapsed_w + interval ))
     if [[ $elapsed_w -ge $max_wait ]]; then
       echo
-      warn "Watch timeout (${max_wait}s) — Spark may still be processing in the background"
+      warn "Watch timeout (${max_wait}s) — trips=${trips_n:-?}/${expected} — Spark may still be processing"
       return 0
     fi
     sleep $interval
@@ -514,10 +542,14 @@ info "PostgreSQL JDBC). This takes 2–5 minutes. We'll proceed with the upload 
 
 section "STAGE 6 — Upload trips.csv to the API"
 
-narrate "The FastAPI endpoint POST /ingestions accepts a CSV file and publishes"
-narrate "one Kafka event per row. Each event carries a deterministic trip_id"
-narrate "(SHA-256 of stable fields, excluding ingestion_id) — enabling cross-batch"
-narrate "deduplication downstream in Spark."
+narrate "The FastAPI endpoint POST /ingestions accepts a CSV file, parses all rows"
+narrate "synchronously, and returns HTTP 202 immediately with the ingestion_id and"
+narrate "row count — before any event reaches Kafka."
+narrate ""
+narrate "A BackgroundTask then publishes one Kafka event per row with a configurable"
+narrate "delay (PUBLISH_DELAY_SECONDS=0.5), simulating a realistic ingestion stream."
+narrate "Each event carries a deterministic trip_id (SHA-256 of stable fields,"
+narrate "excluding ingestion_id) — enabling cross-batch deduplication in Spark."
 
 step "Uploading sample_data/trips.csv"
 echo
@@ -534,13 +566,13 @@ echo
 INGESTION_ID=$(echo "$INGEST_RESPONSE" | grep -o '"ingestion_id":"[^"]*"' | cut -d'"' -f4 || \
                echo "$INGEST_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['ingestion_id'])" 2>/dev/null || \
                echo "")
-ROW_COUNT=$(echo    "$INGEST_RESPONSE" | grep -o '"rows":"[^"]*"' | cut -d'"' -f4 || \
-            echo    "$INGEST_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'])" 2>/dev/null || \
-            echo    "?")
+ROW_COUNT=$(echo "$INGEST_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['rows'])" 2>/dev/null || \
+            echo "$INGEST_RESPONSE" | grep -o '"rows":[0-9]*' | grep -o '[0-9]*' || \
+            echo "?")
 
-ok "Ingestion accepted"
+ok "202 Accepted — ingestion queued for async publish"
 ok "ingestion_id = $INGESTION_ID"
-ok "rows published to Kafka = $ROW_COUNT"
+ok "rows queued for background publish = $ROW_COUNT"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STAGE 1 VALIDATION — API
@@ -653,20 +685,19 @@ narrate ""
 narrate "Results go to two Delta Gold tables AND to PostgreSQL/PostGIS via JDBC."
 narrate "Every Spark micro-batch triggers a foreachBatch write to Postgres."
 
-step "Waiting for Job 2 to write the first Gold micro-batch"
+step "Waiting for Job 2 streaming queries to initialise"
+info "(Job 2 waits for the Silver table to exist, then starts all four streaming queries.)"
+info "(We wait for the checkpoint metadata file — created on query start, before any commit.)"
 echo
 
-wait_for "Gold trip_clusters checkpoint" 300 \
-  'test -f data/checkpoints/gold_trip_clusters/commits/0'
+wait_for "Job 2 streaming started" 300 \
+  'test -f data/checkpoints/gold_trip_clusters/metadata'
 
-wait_for "PostgreSQL rows (trip_clusters)" 300 \
-  'docker exec -i postgres psql -U trips -d trips -tAc "SELECT 1 FROM trip_clusters LIMIT 1" | grep -q 1'
-
-wait_for "PostgreSQL rows (trips)" 300 \
-  'docker exec -i postgres psql -U trips -d trips -tAc "SELECT 1 FROM trips LIMIT 1" | grep -q 1'
-
-step "Watching table counts grow in real time"
-watch_pg_counts 120
+step "Watching PostgreSQL counts grow in real time (Job 2 streaming micro-batches)"
+info "Job 2 streams are initialised — waiting for ${ROW_COUNT} trips to appear in PostgreSQL."
+info "maxFilesPerTrigger=${MAX_FILES_PER_TRIGGER:-1} Silver file/trigger × trigger=5s."
+echo
+watch_pg_counts 600 "$ROW_COUNT"
 
 step "Gold Delta files on disk"
 echo

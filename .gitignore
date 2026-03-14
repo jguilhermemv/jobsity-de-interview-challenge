@@ -8,3 +8,4 @@ data/checkpoints/
 data/delta/
 logs/
 node_modules/
+docs/.DS_Store
