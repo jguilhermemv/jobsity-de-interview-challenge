@@ -6,3 +6,4 @@ data/airflow/
 data/postgres/
 data/checkpoints/
 data/delta/
+logs/

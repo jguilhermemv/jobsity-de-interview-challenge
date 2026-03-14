@@ -88,6 +88,10 @@ for arg in "$@"; do
       echo "  First run  (build + Maven download):  20–35 min"
       echo "  Subsequent (--resume --skip-build):    5–10 min"
       echo ""
+      echo "Log file:"
+      echo "  Output is tee'd to logs/demo_YYYYMMDD_HHMMSS.log (ANSI codes stripped)."
+      echo "  Override directory with: LOG_DIR=/path/to/dir bash demo.sh"
+      echo ""
       echo "Examples:"
       echo "  bash demo.sh                           # clean run from scratch"
       echo "  bash demo.sh --resume --skip-build     # reuse containers, skip build"
@@ -98,6 +102,21 @@ for arg in "$@"; do
       echo "Unknown flag: $arg  (use --help)" && exit 1 ;;
   esac
 done
+
+# ── Log file setup ─────────────────────────────────────────────────────────────
+# All output goes to both the terminal (with ANSI colours) and a plain-text log
+# file (ANSI escape sequences stripped so it is grep/cat friendly).
+#   Override the directory with:  LOG_DIR=/tmp bash demo.sh
+LOG_DIR="${LOG_DIR:-logs}"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/demo_$(date +%Y%m%d_%H%M%S).log"
+
+# ESC char used in the sed ANSI-stripping expression (portable: no \x1B needed)
+_ESC=$(printf '\033')
+# Redirect stdout → tee → (console) + (strip-ANSI → log file)
+#              stderr is merged into stdout so errors also appear in the log
+exec > >(tee >(sed "s/${_ESC}\[[0-9;:]*[A-Za-z]//g; s/\r//g" >> "$LOG_FILE")) 2>&1
+echo -e "\033[2mLogging to: ${LOG_FILE}\033[0m"
 
 # ── Pretty helpers ─────────────────────────────────────────────────────────────
 hr()       { echo -e "${DIM}$(printf '─%.0s' {1..72})${NC}"; }
@@ -920,4 +939,5 @@ echo -e "   ${MGT}☁${NC}  Airflow     →  Databricks Workflows or Amazon MWAA
 echo -e "   ${MGT}☁${NC}  FastAPI     →  Amazon EKS + ALB with HPA"
 echo
 echo -e "  ${DIM}Full docs: README.md | Architecture: docs/solution-architecture-proposal-en-us.md${NC}"
+echo -e "  ${DIM}Log file:  ${LOG_FILE}${NC}"
 echo
