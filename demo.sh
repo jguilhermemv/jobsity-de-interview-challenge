@@ -299,8 +299,57 @@ section "STAGE 0 — Prerequisites"
 
 step "Checking required tools"
 
-command -v docker  &>/dev/null || die "docker not found. Install Docker Desktop first."
+command -v docker  &>/dev/null || die "docker not found. Install Docker Desktop, Colima, or Rancher Desktop first."
 ok "docker found: $(docker --version)"
+
+# ── Docker runtime check ────────────────────────────────────────────────────
+# On macOS the Docker CLI is just a client; it needs a running VM/daemon.
+# Supported runtimes: Colima, Rancher Desktop, or Docker Desktop.
+# We first probe the daemon (fast). If that fails, we try to auto-start Colima.
+step "Checking Docker daemon / runtime"
+
+_docker_running() { docker info &>/dev/null 2>&1; }
+
+if _docker_running; then
+  ok "Docker daemon is reachable"
+else
+  # Docker daemon is NOT running — check which runtime is available
+  if command -v colima &>/dev/null; then
+    warn "Docker daemon not responding. Colima is installed — attempting to start it (arch: x86_64)..."
+    # --arch x86_64 is required because several images in the stack (Spark, Kafka)
+    # are only published for linux/amd64 and do not have ARM64 variants.
+    if colima start --arch x86_64 2>&1 | indent; then
+      # Give the socket a moment to become available
+      _wait=0
+      while ! _docker_running && [[ $_wait -lt 30 ]]; do
+        sleep 2; _wait=$(( _wait + 2 ))
+      done
+      if _docker_running; then
+        ok "Colima started — Docker daemon is now reachable"
+      else
+        die "Colima started but Docker daemon is still not reachable after 30 s. Check 'colima status'."
+      fi
+    else
+      die "Failed to start Colima. Run 'colima start' manually and re-run this script."
+    fi
+  elif command -v limactl &>/dev/null; then
+    # Rancher Desktop uses lima under the hood but exposes its own CLI
+    die "Docker daemon is not running. Please open Rancher Desktop and wait until it is ready, then re-run this script."
+  else
+    echo
+    echo -e "  ${RED}${BOLD}✖  Docker daemon is not running and no known runtime was auto-detected.${NC}"
+    echo
+    echo -e "  To fix this, install and start one of the following:"
+    echo -e "   ${CYN}• Colima (recommended, lightweight):${NC}"
+    echo -e "       brew install colima && colima start"
+    echo -e "   ${CYN}• Rancher Desktop:${NC}"
+    echo -e "       https://rancherdesktop.io"
+    echo -e "   ${CYN}• Docker Desktop:${NC}"
+    echo -e "       https://www.docker.com/products/docker-desktop"
+    echo
+    exit 1
+  fi
+fi
 
 # Support both 'docker compose' (V2 plugin) and 'docker-compose' (legacy).
 # DC is an array so it expands correctly as a command even with spaces.
