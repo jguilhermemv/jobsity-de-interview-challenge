@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS datasources (
 
 CREATE TABLE IF NOT EXISTS trips (
     trip_id              TEXT PRIMARY KEY,
+    ingestion_id         TEXT,
     region               TEXT NOT NULL,
     origin_lon           DOUBLE PRECISION NOT NULL,
     origin_lat           DOUBLE PRECISION NOT NULL,
@@ -95,6 +96,7 @@ CREATE OR REPLACE TRIGGER trip_lookup_sync_trigger
 -- ---------------------------------------------------------------------------
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_trips_trip_id               ON trips(trip_id);
+CREATE        INDEX IF NOT EXISTS idx_trips_ingestion_id          ON trips(ingestion_id);
 CREATE        INDEX IF NOT EXISTS idx_trips_region                ON trips(region);
 CREATE        INDEX IF NOT EXISTS idx_trips_datasource            ON trips(datasource);
 CREATE        INDEX IF NOT EXISTS idx_trips_datetime              ON trips(datetime);

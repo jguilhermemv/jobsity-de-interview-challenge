@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 import pytest
 
 pyspark = pytest.importorskip("pyspark")
@@ -6,6 +9,16 @@ from pyspark.sql import SparkSession  # noqa: E402
 from de_challenge.spark.transforms import add_geohashes, add_time_bucket  # noqa: E402
 
 _BASE32_CHARS = set("0123456789bcdefghjkmnpqrstuvwxyz")
+
+# Skip when: Java not available, or Python 3.14+ (PySpark pickle/recursion issues)
+_java_available = subprocess.run(
+    ["java", "-version"], capture_output=True, timeout=5
+).returncode == 0
+_python_ok = sys.version_info < (3, 14)
+requires_spark_env = pytest.mark.skipif(
+    not _java_available or not _python_ok,
+    reason="Java required; Python 3.14+ has PySpark serialization issues",
+)
 
 # Known geohash values for reference points (validated against the standard
 # geohash algorithm).  Precision-1 values are used because they are easy to
@@ -19,6 +32,7 @@ _KNOWN = [
 
 
 @pytest.mark.integration
+@requires_spark_env
 def test_spark_transforms_smoke():
     spark = SparkSession.builder.master("local[1]").appName("test").getOrCreate()
     data = [
@@ -48,6 +62,7 @@ def test_spark_transforms_smoke():
 
 
 @pytest.mark.integration
+@requires_spark_env
 @pytest.mark.parametrize("lon,lat,precision,expected", _KNOWN)
 def test_geohash_known_values(lon, lat, precision, expected):
     """Verify that the native Spark implementation matches known geohash values."""

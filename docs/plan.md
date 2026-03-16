@@ -30,3 +30,21 @@ Build a local, containerized Kafka + Spark + PostGIS stack with geohash-based sp
 - Invalid rows are written to both `rejected_trips` Delta and `trips.rejected` Kafka topic.
 - Delta tables stored under `data/delta/`.
 - Postgres is the system of record for gold tables with unique constraint on `trip_id`.
+
+## Current Fix Cycle
+1. Reproduce why `bronze_to_silver_stream` enters retry in Airflow.
+2. Add a regression test proving `de_challenge.spark.job1` can be imported before any Spark session is created.
+3. Remove top-level PySpark `Column` expressions from `job1.py` so the streaming job starts correctly under `spark-submit`.
+4. Validate with targeted tests and a fresh Airflow task run.
+
+## Current Fix Cycle 2
+1. Reproduce the latest `bronze_to_silver_stream` failure from Airflow logs.
+2. Add a regression test covering the Silver projection in `job1.py`.
+3. Fix the Silver transformation so `raw_payload` and `kafka_timestamp` are derived before metadata columns are dropped.
+4. Validate with targeted tests and a rerun of the Airflow task.
+
+## Current Fix Cycle 3
+1. Reproduce why SSE downstream statuses were missing after the API emitted `COMPLETED`.
+2. Confirm whether the Kafka marker and status topics were absent or just not being populated.
+3. Validate the running Docker containers against the workspace code and rebuild stale `api` / `airflow` images when needed.
+4. Update `README.md` so local runs explicitly mention `docker compose ... --build` when runtime images may be outdated.

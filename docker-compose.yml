@@ -21,9 +21,9 @@ services:
     platform: linux/amd64
     container_name: postgres
     environment:
-      - POSTGRES_USER=trips
-      - POSTGRES_PASSWORD=trips
-      - POSTGRES_DB=trips
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
     ports:
       - "5432:5432"
     volumes:
@@ -36,14 +36,14 @@ services:
       dockerfile: docker/api.Dockerfile
     container_name: api
     environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - TRIPS_TOPIC=trips.raw
-      - PUBLISH_DELAY_SECONDS=0.5
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+      - TRIPS_TOPIC=${TRIPS_TOPIC}
+      - PUBLISH_DELAY_SECONDS=${PUBLISH_DELAY_SECONDS}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
-      - POSTGRES_DB=trips
-      - POSTGRES_USER=trips
-      - POSTGRES_PASSWORD=trips
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
     ports:
       - "8000:8000"
     depends_on:
@@ -75,6 +75,8 @@ services:
       - "/opt/spark/bin/spark-class"
       - "org.apache.spark.deploy.worker.Worker"
       - "spark://spark-master:7077"
+    cpus: "8"
+    mem_limit: 6g
     depends_on:
       - spark-master
     volumes:
@@ -89,14 +91,19 @@ services:
     command: ["webserver"]
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://trips:trips@postgres:5432/airflow
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW__CORE__DEFAULT_TIMEZONE=America/Recife
       - AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE=America/Recife
       - DELTA_BASE_PATH=/opt/spark-data/delta
       - CHECKPOINT_BASE_PATH=/opt/spark-data/checkpoints
-      - MAX_OFFSETS_PER_TRIGGER=10
-      - MAX_FILES_PER_TRIGGER=1
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+      - TRIPS_TOPIC=${TRIPS_TOPIC}
+      - POSTGRES_URL=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - MAX_OFFSETS_PER_TRIGGER=${MAX_OFFSETS_PER_TRIGGER}
+      - MAX_FILES_PER_TRIGGER=${MAX_FILES_PER_TRIGGER}
     volumes:
       - ./data/airflow:/opt/airflow
       - ./data:/opt/spark-data
@@ -115,14 +122,19 @@ services:
     command: ["scheduler"]
     environment:
       - AIRFLOW__CORE__EXECUTOR=LocalExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://trips:trips@postgres:5432/airflow
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/airflow
       - AIRFLOW__CORE__LOAD_EXAMPLES=False
       - AIRFLOW__CORE__DEFAULT_TIMEZONE=America/Recife
       - AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE=America/Recife
       - DELTA_BASE_PATH=/opt/spark-data/delta
       - CHECKPOINT_BASE_PATH=/opt/spark-data/checkpoints
-      - MAX_OFFSETS_PER_TRIGGER=10
-      - MAX_FILES_PER_TRIGGER=1
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS}
+      - TRIPS_TOPIC=${TRIPS_TOPIC}
+      - POSTGRES_URL=jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - MAX_OFFSETS_PER_TRIGGER=${MAX_OFFSETS_PER_TRIGGER}
+      - MAX_FILES_PER_TRIGGER=${MAX_FILES_PER_TRIGGER}
     volumes:
       - ./data/airflow:/opt/airflow
       - ./data:/opt/spark-data

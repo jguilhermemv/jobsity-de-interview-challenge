@@ -43,6 +43,11 @@
 #  APPROX. RUNTIME:
 #    First run  (build + Ivy download):  20–35 min
 #    Subsequent (--resume):               5–10 min
+#
+#  RESOURCE REQUIREMENTS:
+#    Docker VM (Colima, Docker Desktop) must have ≥8 CPUs and ≥8 GB RAM.
+#    Spark worker needs 8 CPUs and 6 GB. With less, Job 2 may timeout.
+#    Colima: colima start --arch x86_64 --cpu 8 --memory 8
 # =============================================================================
 set -euo pipefail
 IFS=$'\n\t'
@@ -52,6 +57,8 @@ cd "$SCRIPT_DIR"
 
 # ── Demo-wide start time (set before any flag parsing so --help doesn't skew it)
 DEMO_START=$(date +%s)
+SECTION_START=$DEMO_START
+FOOTER_TIMER_PID=""
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -84,6 +91,8 @@ for arg in "$@"; do
       echo "  --skip-build   Skip 'docker compose build' (images already built)"
       echo "  --no-tests     Skip the pytest unit/contract test suite"
       echo "  --help, -h     Show this help message and exit"
+      echo ""
+      echo "Resource requirements: Docker VM ≥8 CPUs, ≥8 GB RAM (Colima: colima start --cpu 8 --memory 8)"
       echo ""
       echo "Approximate runtime:"
       echo "  First run  (build + Maven download):  20–35 min"
@@ -128,6 +137,52 @@ elapsed() {
   printf "%02d:%02d:%02d" $(( s/3600 )) $(( (s%3600)/60 )) $(( s%60 ))
 }
 
+# Returns elapsed time since SECTION_START as HH:MM:SS
+section_elapsed() {
+  local s=$(( $(date +%s) - SECTION_START ))
+  printf "%02d:%02d:%02d" $(( s/3600 )) $(( (s%3600)/60 )) $(( s%60 ))
+}
+
+# Starts a live footer timer on the last terminal line.
+# Updates every second using ESC-7/ESC-8 (DEC save/restore cursor) so the
+# main output stream is never disturbed. No scrolling region — no layout side
+# effects.
+start_footer_timer() {
+  (
+    trap 'exit 0' TERM INT
+    while true; do
+      local s=$(( $(date +%s) - DEMO_START ))
+      local hms
+      hms=$(printf "%02d:%02d:%02d" $(( s/3600 )) $(( (s%3600)/60 )) $(( s%60 )))
+      local r
+      r=$(tput lines 2>/dev/null || echo 24)
+      printf '\0337\033[%s;1H\033[2K\033[7m  ⏱  Demo running: +%s  \033[0m\0338' \
+        "$r" "$hms" 2>/dev/null
+      sleep 1
+    done
+  ) &
+  FOOTER_TIMER_PID=$!
+  disown "$FOOTER_TIMER_PID" 2>/dev/null
+}
+
+# Kills the footer timer and clears the footer line.
+stop_footer_timer() {
+  if [[ -n "${FOOTER_TIMER_PID:-}" ]]; then
+    kill "$FOOTER_TIMER_PID" 2>/dev/null
+    wait "$FOOTER_TIMER_PID" 2>/dev/null || true
+    FOOTER_TIMER_PID=""
+  fi
+  local rows
+  rows=$(tput lines 2>/dev/null || echo 24)
+  printf '\0337\033[%s;1H\033[2K\0338' "$rows" 2>/dev/null
+}
+
+# Cleanup on normal exit (including after explicit `exit` calls).
+trap 'stop_footer_timer' EXIT
+# On Ctrl+C / SIGTERM: clean up then exit with standard signal codes.
+trap 'stop_footer_timer; exit 130' INT
+trap 'stop_footer_timer; exit 143' TERM
+
 banner() {
   echo
   echo -e "${BOLD}${BLU}╔$(printf '═%.0s' {1..72})╗${NC}"
@@ -137,11 +192,18 @@ banner() {
   echo -e "${BOLD}${BLU}╚$(printf '═%.0s' {1..72})╝${NC}"
 }
 
-# section <title>  — prints a cyan box header with elapsed time on the right
+# section <title>  — prints a cyan box header.
+# Top line: title + global elapsed (right-aligned).
+# Second line: section elapsed since previous section started (frozen label).
+# Resets SECTION_START to now so the next section measures from here.
 section() {
+  local prev_section_dur
+  prev_section_dur=$(section_elapsed)
+  SECTION_START=$(date +%s)
   echo
   echo -e "${BOLD}${CYN}┌$(printf '─%.0s' {1..72})┐${NC}"
   printf "${BOLD}${CYN}│  ${NC}${BOLD}%-59s${DIM}  +%-8s${CYN}│${NC}\n" "$1" "$(elapsed)"
+  printf "${BOLD}${CYN}│  ${DIM}%-68s${CYN}│${NC}\n" "previous section: ${prev_section_dur}"
   echo -e "${BOLD}${CYN}└$(printf '─%.0s' {1..72})┘${NC}"
 }
 
@@ -155,37 +217,119 @@ narrate() { echo -e "\n  ${DIM}  » $*${NC}"; }
 indent()  { sed 's/^/       /'; }
 
 # wait_for <label> <timeout_seconds> <shell_expression>
+# Shows a spinner + per-task elapsed time while polling, e.g.:
+#   Waiting for Job 1 Bronze — first commit  ⠋ ⏱ +00:02:31
+# Overwrites the line in-place each tick (interval=1s for smooth spinner).
 wait_for() {
   local label="$1" timeout="$2" expr="$3"
-  local elapsed_w=0 interval=4
-  printf "     Waiting for %-42s" "$label ..."
+  local task_start interval=1
+  task_start=$(date +%s)
+  local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+  local fi=0
+
+  printf "     ${DIM}Waiting for${NC} %-44s" "$label"
   while ! eval "$expr" &>/dev/null 2>&1; do
-    if [[ $elapsed_w -ge $timeout ]]; then
-      echo -e " ${RED}TIMEOUT (${timeout}s)${NC}"
+    local task_s=$(( $(date +%s) - task_start ))
+    local task_hms
+    task_hms=$(printf "%02d:%02d:%02d" $(( task_s/3600 )) $(( (task_s%3600)/60 )) $(( task_s%60 )))
+    printf "\r     ${DIM}Waiting for${NC} %-44s ${CYN}%s${NC}  ${DIM}⏱ +%s${NC}" \
+      "$label" "${frames[$fi]}" "$task_hms"
+    fi=$(( (fi + 1) % ${#frames[@]} ))
+    if [[ $(( $(date +%s) - task_start )) -ge $timeout ]]; then
+      echo -e "\n     ${RED}✖  TIMEOUT (${timeout}s) — ${label}${NC}"
       return 1
     fi
-    printf "."
     sleep "$interval"
-    elapsed_w=$((elapsed_w + interval))
   done
-  echo -e " ${GRN}ready${NC}  ${DIM}[+$(elapsed)]${NC}"
+  local task_s=$(( $(date +%s) - task_start ))
+  local task_hms
+  task_hms=$(printf "%02d:%02d:%02d" $(( task_s/3600 )) $(( (task_s%3600)/60 )) $(( task_s%60 )))
+  printf "\r     ${GRN}✔  %-44s ${NC}${DIM}ready  ⏱ +%s${NC}\n" "$label" "$task_hms"
 }
 
-# watch_pg_counts <max_wait_seconds> [expected_trips]
-# Refreshes PostgreSQL table counts in-place every 2 s.
-# If expected_trips is given, waits until trips >= expected_trips before
-# checking stability. Stability = unchanged for 4 consecutive checks (8s).
-# Uses ANSI cursor-up to overwrite previous output.
+# Returns the latest Kafka partition-0 offset consumed by Spark Job1.
+# Reads the most recent file in data/checkpoints/job1_unified/offsets/
+# (host filesystem — no Kafka tools required).
+get_job1_checkpoint_offset() {
+  local ckpt_dir="data/checkpoints/job1_unified/offsets"
+  local latest
+  latest=$(ls "$ckpt_dir" 2>/dev/null | sort -n | tail -1)
+  [[ -z "$latest" ]] && echo "0" && return
+  python3 -c "
+import json, sys
+lines = open('${ckpt_dir}/${latest}').read().strip().split('\n')
+for line in reversed(lines):
+    try:
+        d = json.loads(line)
+        if 'trips.raw' in d:
+            print(sum(int(v) for v in d['trips.raw'].values()))
+            sys.exit(0)
+    except Exception:
+        pass
+print(0)
+" 2>/dev/null || echo "0"
+}
+
+# watch_pg_counts <max_wait_seconds> [expected_trips] [expected_kafka_offset]
+#
+# Two-phase watch:
+#   Phase 1 — polls the Spark Job1 checkpoint offset until it reaches
+#              expected_kafka_offset. This is the precise signal that Job1
+#              has consumed every Kafka event published for this ingestion.
+#              No heuristics, no timing guesses.
+#   Phase 2 — waits a fixed 15 s buffer for Job2 to write its last
+#              micro-batch to PostgreSQL, then polls until the trip count
+#              is unchanged for 4 consecutive checks (8 s = truly stable).
+#
+# Uses ANSI cursor-up to overwrite the live count display in-place.
+# All 4 PG counts are fetched in a single docker exec / psql round-trip.
 watch_pg_counts() {
   local max_wait="${1:-120}"
   local expected="${2:-0}"
+  local expected_kafka_offset="${3:-0}"
   local interval=2
   local elapsed_w=0
-  local prev_trips=-1
-  local stable=0
-  local NLINES=6   # 4 data rows + 1 blank line + 1 timestamp line
-  local first=true
 
+  # ── Phase 1: wait for Job1 to consume all Kafka events ──────────────────
+  if [[ "$expected_kafka_offset" -gt 0 ]]; then
+    echo
+    echo -e "     ${BOLD}Phase 1${NC}  ${DIM}waiting for Spark Job1 to consume all Kafka events${NC}"
+    echo -e "     ${DIM}(target offset: ${expected_kafka_offset})${NC}"
+    echo
+
+    local p1_first=true
+    while true; do
+      local ckpt_offset
+      ckpt_offset=$(get_job1_checkpoint_offset)
+
+      if ! $p1_first; then printf '\033[1A\r\033[2K'; fi
+      p1_first=false
+
+      if [[ "$ckpt_offset" =~ ^[0-9]+$ && "$ckpt_offset" -ge "$expected_kafka_offset" ]]; then
+        echo -e "     ${GRN}✔${NC}  Job1 checkpoint: ${BOLD}${ckpt_offset}${NC} / ${expected_kafka_offset} — all events consumed"
+        break
+      fi
+      echo -e "     ${DIM}Job1 checkpoint: ${ckpt_offset:-0} / ${expected_kafka_offset}  (global +$(elapsed)  section +$(section_elapsed))${NC}"
+
+      elapsed_w=$(( elapsed_w + interval ))
+      if [[ $elapsed_w -ge $max_wait ]]; then
+        echo
+        warn "Phase 1 timeout (${max_wait}s) — Job1 checkpoint: ${ckpt_offset:-0}/${expected_kafka_offset}"
+        break
+      fi
+      sleep $interval
+    done
+
+    echo
+    echo -e "     ${DIM}Phase 2: waiting 15 s for Job2 to flush last micro-batch…${NC}"
+    sleep 15
+    echo -e "     ${GRN}✔${NC}  Job2 buffer elapsed — checking PostgreSQL stability"
+    # Reset timer: Phase 2 gets its own 60 s window for stability detection.
+    elapsed_w=0
+    max_wait=60
+  fi
+
+  # ── Phase 2: poll PostgreSQL until count is stable ───────────────────────
   echo
   if [[ "$expected" -gt 0 ]]; then
     echo -e "     ${BOLD}Live PostgreSQL counts${NC}  ${DIM}(refreshes every ${interval}s — target: ${expected} trips)${NC}"
@@ -194,19 +338,31 @@ watch_pg_counts() {
   fi
   echo
 
-  while true; do
-    local trips_n;    trips_n=$(pg "SELECT COUNT(*) FROM trips;"         2>/dev/null | tr -d '[:space:]') || trips_n="?"
-    local clusters_n; clusters_n=$(pg "SELECT COUNT(*) FROM trip_clusters;" 2>/dev/null | tr -d '[:space:]') || clusters_n="?"
-    local regions_n;  regions_n=$(pg "SELECT COUNT(*) FROM regions;"       2>/dev/null | tr -d '[:space:]') || regions_n="?"
-    local ds_n;       ds_n=$(pg "SELECT COUNT(*) FROM datasources;"        2>/dev/null | tr -d '[:space:]') || ds_n="?"
-    local hms; hms=$(elapsed)
+  local prev_trips=-1
+  local stable=0
+  local NLINES=6
+  local first=true
 
-    if ! $first; then
-      printf '\033[%dA' $NLINES
-    fi
+  while true; do
+    local _row
+    _row=$(docker exec -i postgres psql -U trips -d trips --no-align -t -c \
+      "SELECT (SELECT COUNT(*) FROM trips),(SELECT COUNT(*) FROM trip_clusters),(SELECT COUNT(*) FROM regions),(SELECT COUNT(*) FROM datasources);" \
+      2>/dev/null) || _row="?|?|?|?"
+
+    local trips_n clusters_n regions_n ds_n
+    trips_n=$(   printf '%s' "$_row" | cut -d'|' -f1 | tr -d '[:space:]')
+    clusters_n=$(printf '%s' "$_row" | cut -d'|' -f2 | tr -d '[:space:]')
+    regions_n=$( printf '%s' "$_row" | cut -d'|' -f3 | tr -d '[:space:]')
+    ds_n=$(      printf '%s' "$_row" | cut -d'|' -f4 | tr -d '[:space:]')
+
+    [[ -z "$trips_n"    ]] && trips_n="?"
+    [[ -z "$clusters_n" ]] && clusters_n="?"
+    [[ -z "$regions_n"  ]] && regions_n="?"
+    [[ -z "$ds_n"       ]] && ds_n="?"
+
+    if ! $first; then printf '\033[%dA' $NLINES; fi
     first=false
 
-    # Show progress indicator when expected count is known
     local pct=""
     if [[ "$expected" -gt 0 && "$trips_n" =~ ^[0-9]+$ ]]; then
       pct="  ($(( trips_n * 100 / expected ))%)"
@@ -217,43 +373,30 @@ watch_pg_counts() {
     echo -e "\r\033[2K     ${CYN}regions          ${NC}  ${BOLD}${GRN}${regions_n}${NC}"
     echo -e "\r\033[2K     ${CYN}datasources      ${NC}  ${BOLD}${GRN}${ds_n}${NC}"
     echo -e "\r\033[2K"
-    printf   "\r\033[2K     ${DIM}elapsed: +%s${NC}\n" "$hms"
+    printf   "\r\033[2K     ${DIM}elapsed: +%s global  +%s section${NC}\n" "$(elapsed)" "$(section_elapsed)"
 
-    # Stability logic:
-    #   - Skip while trips=0 (Job 2 hasn't written yet)
-    #   - Skip while trips < expected (still processing)
-    #   - Once trips >= expected (or no expected given and trips > 0):
-    #     declare stable after 4 unchanged checks (8s)
     if [[ "$trips_n" =~ ^[0-9]+$ && "$trips_n" -gt 0 ]]; then
-      local ready=false
-      if [[ "$expected" -gt 0 ]]; then
-        [[ "$trips_n" -ge "$expected" ]] && ready=true
-      else
-        ready=true
-      fi
-
-      if $ready; then
-        if [[ "$trips_n" -eq "$prev_trips" ]]; then
-          stable=$(( stable + 1 ))
-          if [[ $stable -ge 4 ]]; then
-            echo
-            ok "Counts stable (trips=${trips_n}) — all rows processed"
-            return 0
-          fi
-        else
-          stable=0
-          prev_trips=$trips_n
-        fi
-      else
+      if [[ "$prev_trips" -eq -1 || "$trips_n" -ne "$prev_trips" ]]; then
         stable=0
         prev_trips=$trips_n
+      else
+        stable=$(( stable + 1 ))
+        if [[ $stable -ge 4 ]]; then
+          echo
+          if [[ "$expected" -gt 0 && "$trips_n" -lt "$expected" ]]; then
+            ok "Counts stable (trips=${trips_n}/${expected}) — deduplication reduced final count"
+          else
+            ok "Counts stable (trips=${trips_n}) — all rows processed"
+          fi
+          return 0
+        fi
       fi
     fi
 
     elapsed_w=$(( elapsed_w + interval ))
     if [[ $elapsed_w -ge $max_wait ]]; then
       echo
-      warn "Watch timeout (${max_wait}s) — trips=${trips_n:-?}/${expected} — Spark may still be processing"
+      warn "Watch timeout (${max_wait}s) — trips=${trips_n:-?}/${expected}"
       return 0
     fi
     sleep $interval
@@ -290,12 +433,18 @@ echo -e "   ${DIM}          → Job 2: Gold Δ (clusters) → PostgreSQL/PostGIS
 hr
 echo
 read -r -p "  Press ENTER to start the demo, or Ctrl+C to abort: " _
+start_footer_timer
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  1.  PREREQUISITES
 # ══════════════════════════════════════════════════════════════════════════════
 
 section "STAGE 0 — Prerequisites"
+
+# Spark worker needs 8 CPUs and 6 GB (docker-compose.yml). Define early for Colima auto-start.
+REQUIRED_MEM_GB=7.5
+REQUIRED_CPUS=8
+COLIMA_MEMORY=8
 
 step "Checking required tools"
 
@@ -315,10 +464,11 @@ if _docker_running; then
 else
   # Docker daemon is NOT running — check which runtime is available
   if command -v colima &>/dev/null; then
-    warn "Docker daemon not responding. Colima is installed — attempting to start it (arch: x86_64)..."
+    warn "Docker daemon not responding. Colima is installed — attempting to start it (arch: x86_64, cpu: ${REQUIRED_CPUS}, memory: ${COLIMA_MEMORY} GB)..."
     # --arch x86_64 is required because several images in the stack (Spark, Kafka)
     # are only published for linux/amd64 and do not have ARM64 variants.
-    if colima start --arch x86_64 2>&1 | indent; then
+    # --cpu and --memory ensure the Spark worker (8 CPUs, 6 GB) can be allocated.
+    if colima start --arch x86_64 --cpu "${REQUIRED_CPUS}" --memory "${COLIMA_MEMORY}" 2>&1 | indent; then
       # Give the socket a moment to become available
       _wait=0
       while ! _docker_running && [[ $_wait -lt 30 ]]; do
@@ -341,7 +491,7 @@ else
     echo
     echo -e "  To fix this, install and start one of the following:"
     echo -e "   ${CYN}• Colima (recommended, lightweight):${NC}"
-    echo -e "       brew install colima && colima start"
+    echo -e "       brew install colima && colima start --arch x86_64 --cpu ${REQUIRED_CPUS} --memory ${COLIMA_MEMORY}"
     echo -e "   ${CYN}• Rancher Desktop:${NC}"
     echo -e "       https://rancherdesktop.io"
     echo -e "   ${CYN}• Docker Desktop:${NC}"
@@ -365,15 +515,57 @@ ok "docker compose found: $("${DC[@]}" version)"
 command -v curl &>/dev/null || die "curl not found. Please install curl."
 ok "curl found: $(curl --version | head -1)"
 
-# Check available memory (warn only — we need ~4 GB for Spark)
-if command -v sysctl &>/dev/null; then
-  MEM_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
-  MEM_GB=$(( MEM_BYTES / 1024 / 1024 / 1024 ))
-  if [[ $MEM_GB -lt 4 ]]; then
-    warn "Only ${MEM_GB} GB RAM detected. Spark needs ~4 GB — performance may degrade."
+# ── Docker VM memory check ─────────────────────────────────────────────────────
+# The Spark worker requires 8 CPUs and 6 GB (docker-compose.yml). The Docker VM
+# (Colima, Docker Desktop, etc.) must have enough resources or jobs will hang.
+step "Checking Docker VM resources (Spark worker needs 8 CPUs, 6 GB)"
+
+DOCKER_INFO=$(docker info 2>/dev/null) || true
+
+# Parse memory from docker info — format: "Memory: 7.8GiB" or "Total Memory: 8192MiB"
+MEM_LINE=$(echo "$DOCKER_INFO" | grep -iE "memory|mem total" | head -1)
+MEM_GB=""
+if [[ "$MEM_LINE" =~ ([0-9]+\.?[0-9]*)[[:space:]]*(GiB|GB) ]]; then
+  MEM_GB="${BASH_REMATCH[1]}"
+elif [[ "$MEM_LINE" =~ ([0-9]+)[[:space:]]*(MiB|MB) ]]; then
+  MEM_VAL="${BASH_REMATCH[1]}"
+  MEM_GB=$(awk "BEGIN {printf \"%.1f\", $MEM_VAL / 1024}" 2>/dev/null || echo "$(( MEM_VAL / 1024 ))")
+fi
+
+# Parse CPUs — format: "CPUs: 8" or "NCPU: 8"
+CPU_LINE=$(echo "$DOCKER_INFO" | grep -iE "cpus|ncpu" | head -1)
+CPUS=""
+[[ "$CPU_LINE" =~ ([0-9]+) ]] && CPUS="${BASH_REMATCH[1]}"
+
+if [[ -n "$MEM_GB" && -n "$CPUS" ]]; then
+  MEM_OK=false
+  CPU_OK=false
+  awk "BEGIN {exit !($MEM_GB >= $REQUIRED_MEM_GB)}" 2>/dev/null && MEM_OK=true
+  [[ "$CPUS" -ge "$REQUIRED_CPUS" ]] 2>/dev/null && CPU_OK=true
+
+  if $MEM_OK && $CPU_OK; then
+    ok "Docker VM: ${CPUS} CPUs, ${MEM_GB} GB — sufficient for Spark worker"
   else
-    ok "Memory: ${MEM_GB} GB available"
+    echo
+    echo -e "  ${RED}${BOLD}✖  Insufficient Docker VM resources.${NC}"
+    echo -e "     Detected: ${CPUS:-?} CPUs, ${MEM_GB:-?} GB"
+    echo -e "     Required: ${REQUIRED_CPUS} CPUs, ≥${REQUIRED_MEM_GB} GB (Spark worker: 8 CPUs, 6 GB)"
+    echo
+    if command -v colima &>/dev/null; then
+      echo -e "  ${CYN}Colima detected.${NC} Restart with more resources:"
+      echo -e "     colima stop"
+      echo -e "     colima delete"
+      echo -e "     colima start --arch x86_64 --cpu ${REQUIRED_CPUS} --memory ${COLIMA_MEMORY}"
+      echo
+    else
+      echo -e "  ${CYN}Docker Desktop:${NC} Settings → Resources → increase Memory to ${REQUIRED_MEM_GB} GB, CPUs to ${REQUIRED_CPUS}"
+      echo
+    fi
+    exit 1
   fi
+else
+  warn "Could not parse Docker VM resources. Ensure Colima/Docker Desktop has ≥${REQUIRED_CPUS} CPUs and ≥${REQUIRED_MEM_GB} GB."
+  warn "Otherwise Job 2 may timeout waiting for Spark executor allocation."
 fi
 
 ok "All prerequisites satisfied"
@@ -402,6 +594,7 @@ if $RESET_STATE; then
   info "   deleting them forces a full reprocess from the earliest Kafka offset)"
   rm -rf data/delta/bronze_trips \
          data/delta/silver_trips \
+         data/delta/silver_ingestion_markers \
          data/delta/rejected_trips \
          data/delta/gold_trip_clusters \
          data/delta/gold_weekly_metrics
@@ -411,8 +604,9 @@ if $RESET_STATE; then
 
   step "Removing Airflow runtime data"
   info "data/airflow/  — Airflow metadata DB files, logs, and plugin cache"
-  rm -rf data/airflow
-  ok "Airflow runtime cleared"
+  info "  (preserving data/airflow/.ivy2/ — Maven JAR cache, takes minutes to re-download)"
+  find data/airflow -mindepth 1 -maxdepth 1 ! -name '.ivy2' -exec rm -rf {} + 2>/dev/null || true
+  ok "Airflow runtime cleared (Ivy JAR cache preserved)"
 
   step "Removing PostgreSQL data (named volume)"
   info "postgres_data  — Docker named volume for PostgreSQL"
@@ -573,6 +767,18 @@ cloud "auto-scaling the cluster and checkpointing to S3 (Delta Lake on S3)."
 DAG_ID="trips_streaming_pipeline"
 RUN_ID="demo_$(date +%Y%m%d_%H%M%S)"
 
+step "Pre-creating Kafka topic: trips.raw"
+info "Job 1 connects to Kafka at startup — the topic must exist before spark-submit runs."
+info "Without pre-creation, Spark raises UnknownTopicOrPartitionException and the job crashes."
+docker exec kafka kafka-topics.sh \
+  --create \
+  --topic trips.raw \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 \
+  --replication-factor 1 \
+  --if-not-exists 2>&1 | indent
+ok "Kafka topic trips.raw is ready"
+
 step "Unpausing DAG: $DAG_ID"
 docker exec airflow-webserver \
   airflow dags unpause "$DAG_ID" 2>&1 | indent
@@ -584,7 +790,36 @@ docker exec airflow-webserver \
 ok "DAG triggered — both streaming jobs are starting in the background"
 
 info "On first run, Spark downloads Maven packages (Kafka connector, Delta Lake,"
-info "PostgreSQL JDBC). This takes 2–5 minutes. We'll proceed with the upload now."
+info "PostgreSQL JDBC). This takes 2–5 minutes. Waiting for all streams to be ready"
+info "before uploading — so the data flows live as soon as the CSV is submitted."
+
+step "Waiting for all streaming queries to initialise"
+info "(Job 1 initialises the Silver table with the correct schema at startup — even before"
+info " any Kafka data — so Job 2 starts immediately and both jobs warm up in parallel.)"
+info "(Waiting for commits/0, not just metadata — ensures each stream has fired its first"
+info " trigger and confirmed it can connect to all sources/sinks before data is sent.)"
+echo
+
+wait_for "Job 1 (Bronze+Silver+Markers) — first commit"  600 \
+  'test -f data/checkpoints/job1_unified/commits/0'
+
+wait_for "Job 2 Gold clusters — first commit"  300 \
+  'test -f data/checkpoints/gold_trip_clusters/commits/0'
+
+wait_for "Job 2 Gold weekly — first commit"  180 \
+  'test -f data/checkpoints/gold_weekly_metrics/commits/0'
+
+wait_for "Job 2 Postgres trips — first commit"  180 \
+  'test -f data/checkpoints/postgres_trips/commits/0'
+
+wait_for "Job 2 Postgres clusters — first commit"  120 \
+  'test -f data/checkpoints/postgres_trip_clusters/commits/0'
+
+wait_for "Job 2 Markers completion — first commit"  60 \
+  'test -f data/checkpoints/markers_completion/commits/0'
+
+ok "All 7 streaming queries are hot — pipeline is ready for data"
+cloud "On Databricks: Workflows health-check API confirms job readiness before ingestion."
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  7.  UPLOAD THE CSV
@@ -603,6 +838,10 @@ narrate "excluding ingestion_id) — enabling cross-batch deduplication in Spark
 
 step "Uploading sample_data/trips.csv"
 echo
+
+# Snapshot Job1's Kafka offset before the upload so we can calculate the
+# exact target offset after all ROW_COUNT events have been published.
+START_KAFKA_OFFSET=$(get_job1_checkpoint_offset)
 
 INGEST_RESPONSE=$(
   curl -sf \
@@ -623,6 +862,17 @@ ROW_COUNT=$(echo "$INGEST_RESPONSE" | python3 -c "import sys,json; print(json.lo
 ok "202 Accepted — ingestion queued for async publish"
 ok "ingestion_id = $INGESTION_ID"
 ok "rows queued for background publish = $ROW_COUNT"
+
+step "Live pipeline — watching data flow in real time"
+narrate "The API is publishing ${ROW_COUNT} events to Kafka at 0.5 s/event (~50 s total)."
+narrate "Spark consumes them micro-batch by micro-batch (every 5 s) and writes to PostgreSQL."
+narrate "Watch the trip count grow live:"
+echo
+# Expected Kafka offset = offset before upload + number of rows published.
+# watch_pg_counts Phase 1 polls the Spark checkpoint until Job1 has consumed
+# all events (ROW_COUNT trips + 1 end marker); Phase 2 then checks PostgreSQL stability.
+EXPECTED_KAFKA_OFFSET=$(( START_KAFKA_OFFSET + ROW_COUNT + 1 ))
+watch_pg_counts 180 "$ROW_COUNT" "$EXPECTED_KAFKA_OFFSET"
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  STAGE 1 VALIDATION — API
@@ -664,7 +914,7 @@ OFFSET_RAW=$(
 )
 echo -e "     Offset: ${BOLD}${GRN}$OFFSET_RAW${NC}"
 echo
-info "Format: topic:partition:offset  —  offset should be ≥ $ROW_COUNT"
+info "Format: topic:partition:offset  —  offset should be ≥ $(( ROW_COUNT + 1 )) (rows + end marker)"
 
 step "Reading 3 sample events from the topic"
 echo
@@ -688,20 +938,9 @@ section "VALIDATION — Stage 3: Job 1 — Bronze & Silver Delta Tables"
 narrate "Job 1 is a Spark Structured Streaming application that reads from Kafka"
 narrate "and writes to Delta Lake in two layers:"
 narrate "  • Bronze: raw, unmodified Kafka payloads (append-only)"
-narrate "  • Silver: valid rows, deduplicated by trip_id (1-day watermark)"
+narrate "  • Silver: valid rows, deduplicated by trip_id (1-minute watermark)"
 narrate "  • Rejected: invalid coordinate ranges or null trip_id (DLQ)"
 
-step "Waiting for Spark Job 1 to complete its first micro-batch"
-info "(First run downloads Maven packages — may take 3–6 minutes)"
-echo
-
-wait_for "Bronze Delta checkpoint" 600 \
-  'test -f data/checkpoints/bronze_trips/commits/0'
-
-wait_for "Silver Delta checkpoint" 120 \
-  'test -f data/checkpoints/silver_trips/commits/0'
-
-echo
 step "Delta Lake files on disk"
 echo
 echo -e "     ${BOLD}Bronze layer${NC} (raw Kafka payloads):"
@@ -735,19 +974,9 @@ narrate ""
 narrate "Results go to two Delta Gold tables AND to PostgreSQL/PostGIS via JDBC."
 narrate "Every Spark micro-batch triggers a foreachBatch write to Postgres."
 
-step "Waiting for Job 2 streaming queries to initialise"
-info "(Job 2 waits for the Silver table to exist, then starts all four streaming queries.)"
-info "(We wait for the checkpoint metadata file — created on query start, before any commit.)"
+info "All 4 Job 2 streaming queries were already initialised during the warm-up phase."
+info "PostgreSQL already received live data during the live counter above."
 echo
-
-wait_for "Job 2 streaming started" 300 \
-  'test -f data/checkpoints/gold_trip_clusters/metadata'
-
-step "Watching PostgreSQL counts grow in real time (Job 2 streaming micro-batches)"
-info "Job 2 streams are initialised — waiting for ${ROW_COUNT} trips to appear in PostgreSQL."
-info "maxFilesPerTrigger=${MAX_FILES_PER_TRIGGER:-1} Silver file/trigger × trigger=5s."
-echo
-watch_pg_counts 600 "$ROW_COUNT"
 
 step "Gold Delta files on disk"
 echo
@@ -1048,6 +1277,7 @@ echo
 hr
 
 TOTAL_ELAPSED=$(elapsed)
+stop_footer_timer
 banner "Demo complete — total time: ${TOTAL_ELAPSED}"
 
 echo
@@ -1057,7 +1287,7 @@ echo -e "   ${GRN}✔${NC}  Spark Structured Streaming — continuous, not sched
 echo -e "   ${GRN}✔${NC}  Delta Lake medallion architecture (Bronze / Silver / Gold)"
 echo -e "   ${GRN}✔${NC}  Deterministic trip_id → cross-batch deduplication"
 echo -e "   ${GRN}✔${NC}  Geohash precision-7 + 30-min buckets for spatial clustering"
-echo -e "   ${GRN}✔${NC}  Watermark-based stateful dedup in Spark (1-day window)"
+echo -e "   ${GRN}✔${NC}  Watermark-based stateful dedup in Spark (1-minute window)"
 echo -e "   ${GRN}✔${NC}  PostGIS geometry columns — GIST indexes for spatial queries"
 echo -e "   ${GRN}✔${NC}  Airflow orchestrates long-running streaming jobs"
 echo -e "   ${GRN}✔${NC}  SSE push notifications — no polling on the API"

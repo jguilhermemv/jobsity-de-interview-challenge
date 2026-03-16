@@ -1,4 +1,4 @@
-from de_challenge.contract.events import TripEvent
+from de_challenge.contract.events import IngestionEndEvent, TripEvent
 
 
 def test_trip_event_schema_contains_required_fields():
@@ -15,7 +15,8 @@ def test_trip_event_schema_contains_required_fields():
         datasource="funny_car",
     )
 
-    payload = event.model_dump()
+    # exclude_none matches API publish behavior (record_type omitted for trips)
+    payload = event.model_dump(exclude_none=True)
     assert set(payload.keys()) == {
         "ingestion_id",
         "row_number",
@@ -27,4 +28,20 @@ def test_trip_event_schema_contains_required_fields():
         "destination_lat",
         "datetime",
         "datasource",
+    }
+
+
+def test_ingestion_end_event_schema():
+    event = IngestionEndEvent(
+        record_type="ingestion_end",
+        ingestion_id="ing-1",
+        control_id="ing-1:end",
+        total_rows=42,
+    )
+    payload = event.model_dump()
+    assert payload == {
+        "record_type": "ingestion_end",
+        "ingestion_id": "ing-1",
+        "control_id": "ing-1:end",
+        "total_rows": 42,
     }

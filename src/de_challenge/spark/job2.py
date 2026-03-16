@@ -1,16 +1,30 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from urllib.parse import urlparse
 
-from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
+from pyspark.sql import DataFrame, SparkSession  # pyright: ignore[reportMissingImports]
+from pyspark.sql import functions as F  # pyright: ignore[reportMissingImports]
 
+from de_challenge.spark.status_publisher import publish_ingestion_status
 from de_challenge.spark.transforms import add_geohashes, add_time_bucket
+
+logger = logging.getLogger(__name__)
+
+# Completion check: retry until PG count reaches total_rows
+_COMPLETION_MAX_WAIT = int(os.getenv("TRIPS_PG_COMPLETION_MAX_WAIT", "60"))
+_COMPLETION_POLL_INTERVAL = float(os.getenv("TRIPS_PG_COMPLETION_POLL_INTERVAL", "2.0"))
+
+# Retry config for transient PostgreSQL/network failures
+_WRITE_MAX_RETRIES = int(os.getenv("POSTGRES_WRITE_MAX_RETRIES", "3"))
+_WRITE_INITIAL_BACKOFF = float(os.getenv("POSTGRES_WRITE_INITIAL_BACKOFF", "2.0"))
+_CONNECT_TIMEOUT = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "15"))
 
 _TRIPS_COLS = [
     "trip_id",
+    "ingestion_id",
     "region",
     "origin_lon",
     "origin_lat",
@@ -23,7 +37,7 @@ _TRIPS_COLS = [
 ]
 
 
-def _wait_for_silver(silver_path: str, timeout: int = 300, interval: int = 10) -> None:
+def _wait_for_silver(silver_path: str, timeout: int = 600, interval: int = 3) -> None:
     """
     Block until the Silver Delta table has at least one committed transaction.
 
@@ -48,7 +62,7 @@ def _wait_for_silver(silver_path: str, timeout: int = 300, interval: int = 10) -
 
 def build_spark(app_name: str) -> SparkSession:
     return (
-        SparkSession.builder.appName(app_name)
+        SparkSession.builder.appName(app_name)  # pyright: ignore[reportAttributeAccessIssue]
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config(
             "spark.sql.catalog.spark_catalog",
@@ -59,7 +73,8 @@ def build_spark(app_name: str) -> SparkSession:
 
 
 def _write_trip_clusters(df: DataFrame, url: str, user: str, password: str) -> None:
-    (
+    """Write aggregated clusters to PostgreSQL via JDBC with retry for transient failures."""
+    writer = (
         df.write.mode("append")
         .format("jdbc")
         .option("url", url)
@@ -67,8 +82,102 @@ def _write_trip_clusters(df: DataFrame, url: str, user: str, password: str) -> N
         .option("dbtable", "trip_clusters")
         .option("user", user)
         .option("password", password)
-        .save()
+        .option("connectTimeout", str(_CONNECT_TIMEOUT))
+        .option("socketTimeout", str(_CONNECT_TIMEOUT * 2))
     )
+    last_err = None
+    for attempt in range(_WRITE_MAX_RETRIES):
+        try:
+            writer.save()
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < _WRITE_MAX_RETRIES - 1:
+                backoff = _WRITE_INITIAL_BACKOFF * (2**attempt)
+                logger.warning(
+                    "JDBC write to trip_clusters failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1,
+                    _WRITE_MAX_RETRIES,
+                    e,
+                    backoff,
+                )
+                time.sleep(backoff)
+            else:
+                raise last_err
+
+
+def _process_markers_batch(
+    batch_df: "DataFrame",
+    epoch_id: int,
+    jdbc_url: str,
+    user: str,
+    password: str,
+) -> None:
+    """
+    For each ingestion-end marker: verify PostgreSQL has total_rows for that
+    ingestion_id, then emit TRIPS_PG_COMPLETED. Retries briefly until count matches.
+    """
+    import psycopg2
+
+    rows = batch_df.select("ingestion_id", "total_rows").collect()
+    if not rows:
+        return
+
+    plain = jdbc_url[len("jdbc:"):]
+    parsed = urlparse(plain)
+    host = parsed.hostname
+    port = parsed.port or 5432
+    database = parsed.path.lstrip("/")
+
+    for row in rows:
+        ingestion_id = row["ingestion_id"]
+        total_rows = int(row["total_rows"])
+        deadline = time.time() + _COMPLETION_MAX_WAIT
+        count = 0
+        emitted = False
+        while time.time() < deadline:
+            try:
+                conn = psycopg2.connect(
+                    host=host,
+                    port=port,
+                    database=database,
+                    user=user,
+                    password=password,
+                    connect_timeout=_CONNECT_TIMEOUT,
+                )
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT COUNT(*) FROM trips WHERE ingestion_id = %s",
+                            (ingestion_id,),
+                        )
+                        row = cur.fetchone()
+                        count = row[0] if row else 0
+                    if count >= total_rows:
+                        publish_ingestion_status(
+                            ingestion_id,
+                            "TRIPS_PG_COMPLETED",
+                            {"total_rows": total_rows, "pg_count": count},
+                        )
+                        emitted = True
+                        break
+                finally:
+                    conn.close()
+            except Exception as e:
+                logger.warning(
+                    "TRIPS_PG completion check failed for %s: %s",
+                    ingestion_id,
+                    e,
+                )
+            time.sleep(_COMPLETION_POLL_INTERVAL)
+        if not emitted:
+            logger.warning(
+                "TRIPS_PG_COMPLETED not emitted: ingestion %s count %d < %d after %ds",
+                ingestion_id,
+                count,
+                total_rows,
+                _COMPLETION_MAX_WAIT,
+            )
 
 
 def _write_trips_batch(
@@ -106,43 +215,67 @@ def _write_trips_batch(
     port = parsed.port or 5432
     database = parsed.path.lstrip("/")
 
-    conn = psycopg2.connect(
-        host=host, port=port, database=database, user=user, password=password
-    )
-    try:
-        with conn.cursor() as cur:
-            psycopg2.extras.execute_values(
-                cur,
-                """
-                INSERT INTO trips (
-                    trip_id, region,
-                    origin_lon, origin_lat,
-                    destination_lon, destination_lat,
-                    origin_geohash, destination_geohash,
-                    datetime, datasource
-                )
-                VALUES %s
-                ON CONFLICT (trip_id) DO NOTHING
-                """,
-                [
-                    (
-                        r.trip_id,
-                        r.region,
-                        float(r.origin_lon),
-                        float(r.origin_lat),
-                        float(r.destination_lon),
-                        float(r.destination_lat),
-                        r.origin_geohash,
-                        r.destination_geohash,
-                        r.datetime,
-                        r.datasource,
-                    )
-                    for r in rows
-                ],
+    last_err = None
+    for attempt in range(_WRITE_MAX_RETRIES):
+        try:
+            conn = psycopg2.connect(
+                host=host,
+                port=port,
+                database=database,
+                user=user,
+                password=password,
+                connect_timeout=_CONNECT_TIMEOUT,
             )
-        conn.commit()
-    finally:
-        conn.close()
+            try:
+                with conn.cursor() as cur:
+                    psycopg2.extras.execute_values(
+                        cur,
+                        """
+                        INSERT INTO trips (
+                            trip_id, ingestion_id, region,
+                            origin_lon, origin_lat,
+                            destination_lon, destination_lat,
+                            origin_geohash, destination_geohash,
+                            datetime, datasource
+                        )
+                        VALUES %s
+                        ON CONFLICT (trip_id) DO NOTHING
+                        """,
+                        [
+                            (
+                                r.trip_id,
+                                r.ingestion_id,
+                                r.region,
+                                float(r.origin_lon),
+                                float(r.origin_lat),
+                                float(r.destination_lon),
+                                float(r.destination_lat),
+                                r.origin_geohash,
+                                r.destination_geohash,
+                                r.datetime,
+                                r.datasource,
+                            )
+                            for r in rows
+                        ],
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < _WRITE_MAX_RETRIES - 1:
+                backoff = _WRITE_INITIAL_BACKOFF * (2**attempt)
+                logger.warning(
+                    "psycopg2 write to trips failed (attempt %d/%d): %s — retrying in %.1fs",
+                    attempt + 1,
+                    _WRITE_MAX_RETRIES,
+                    e,
+                    backoff,
+                )
+                time.sleep(backoff)
+            else:
+                raise last_err
 
 
 def run_job2() -> None:
@@ -157,6 +290,7 @@ def run_job2() -> None:
     spark = build_spark("job2-gold-postgis")
 
     _wait_for_silver(f"{delta_base}/silver_trips")
+    _wait_for_silver(f"{delta_base}/silver_ingestion_markers")
     silver = (
         spark.readStream.format("delta")
         .option("maxFilesPerTrigger", max_files)
@@ -221,6 +355,24 @@ def run_job2() -> None:
         )
         .option("checkpointLocation", f"{checkpoint_base}/postgres_trip_clusters")
         .outputMode("update")
+        .trigger(processingTime="5 seconds")
+        .start()
+    )
+
+    # --- Stream 5: Markers → verify PG trips count, emit TRIPS_PG_COMPLETED ---
+    markers_stream = (
+        spark.readStream.format("delta")
+        .option("maxFilesPerTrigger", max_files)
+        .load(f"{delta_base}/silver_ingestion_markers")
+    )
+    (
+        markers_stream.writeStream.foreachBatch(
+            lambda df, eid: _process_markers_batch(
+                df, eid, postgres_url, postgres_user, postgres_password
+            )
+        )
+        .option("checkpointLocation", f"{checkpoint_base}/markers_completion")
+        .outputMode("append")
         .trigger(processingTime="5 seconds")
         .start()
     )

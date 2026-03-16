@@ -12,6 +12,7 @@ Local, containerized data pipeline demonstrating Kafka ingestion, Spark Structur
 4. [Quick Start](#quick-start)
    - [Option A — One-command Demo](#option-a--one-command-demo-recommended)
    - [Option B — Manual Step-by-step](#option-b--manual-step-by-step)
+   - [Presentation Script](#presentation-script)
 5. [Reset and Reprocess from Scratch](#reset-and-reprocess-from-scratch)
 6. [Validate Each Pipeline Stage](#validate-each-pipeline-stage)
 7. [Query API — Weekly Average Trips](#query-api--weekly-average-trips)
@@ -121,7 +122,7 @@ To make the demo complete in ~2 minutes instead of ~10, set these values in `.en
 PUBLISH_DELAY_SECONDS=0
 ```
 
-And in `src/de_challenge/spark/job2.py`, remove the `maxFilesPerTrigger` option. Rebuilding the `api` image (`docker compose build api`) is required after changing `.env`.
+And in `src/de_challenge/spark/job2.py`, remove the `maxFilesPerTrigger` option. Restart the API container to apply `.env` changes: `docker compose up -d api`.
 
 ---
 
@@ -130,31 +131,18 @@ And in `src/de_challenge/spark/job2.py`, remove the `maxFilesPerTrigger` option.
 ### Prerequisites
 
 - Docker and Docker Compose installed
-- ~4 GB of RAM available for the containers
+- **8 CPUs and 8 GB RAM** allocated to the Docker VM (Colima, Docker Desktop, etc.)
 
-### Option A — One-command Demo (recommended)
+The Spark worker requires 8 CPUs and 6 GB (`docker-compose.yml`). With less, Job 2 may timeout waiting for executor allocation.
 
-```bash
-bash demo.sh
-```
+| Runtime | How to configure |
+|---------|------------------|
+| **Colima** | `colima stop` → `colima delete` → `colima start --arch x86_64 --cpu 8 --memory 8` |
+| **Docker Desktop** | Settings → Resources → Memory: 8 GB, CPUs: 8 |
 
-This single script runs the entire pipeline end-to-end: prerequisites check, clean reset, Docker build, infrastructure startup, Airflow initialisation, unit/contract tests, streaming pipeline trigger, CSV upload, stage-by-stage validation, deduplication test, and bonus queries.
+----
 
-| Flag | Effect |
-|---|---|
-| `--resume` | Skip the teardown/reset step (containers already running) |
-| `--skip-build` | Skip `docker compose build` (images already built) |
-| `--no-tests` | Skip the pytest suite |
-
-**Estimated runtime**:
-- First run (build + Ivy/Maven download): **20–35 min**
-- Subsequent runs with `--resume`: **5–10 min**
-
-Progress and all command output are saved to `logs/demo_<timestamp>.log`.
-
----
-
-### Option B — Manual Step-by-step
+### Manual Step-by-step
 
 ### 1. Set up environment variables
 
@@ -166,41 +154,89 @@ The `.env.example` file ships with safe defaults for local development — all v
 
 ### 2. Start the full stack
 
+If you have containers from a previous run, stop them first:
+
 ```bash
-docker compose up -d
+docker compose down --volumes && docker compose up -d --build
 ```
 
 Wait for all services to become healthy (~30–60 seconds).
 
-### 3. Initialize Airflow (first time only)
+> Important: this project copies the application code into the `api` and `airflow` images during Docker build. If you changed files under `src/`, or changed `docker/api.Dockerfile` / `docker/airflow.Dockerfile`, run `docker compose up -d --build api airflow-webserver airflow-scheduler` before testing. Otherwise Docker may keep running stale code.
+
+### 3. Clear previous state for a fresh run
 
 ```bash
-# Create the Airflow metadata database
-docker exec -it postgres psql -U trips -d postgres -c "CREATE DATABASE airflow;"
 
-# Initialize the Airflow schema
-docker compose run --rm airflow-webserver airflow db init
+# Kill Spark processes (long-running streaming jobs)
+docker exec airflow-scheduler pkill -f "job1.py" 2>/dev/null || true &&
+docker exec airflow-scheduler pkill -f "job2.py" 2>/dev/null || true &&
+
+# Remove Delta tables and Spark checkpoints
+rm -rf data/delta/bronze_trips data/delta/silver_trips data/delta/silver_ingestion_markers data/delta/rejected_trips &&
+rm -rf data/delta/gold_trip_clusters data/delta/gold_weekly_metrics &&
+rm -rf data/checkpoints/ &&
+
+# Clear Postgres tables (requires postgres container to be running)
+docker exec -it postgres psql -U trips -d trips -c "TRUNCATE TABLE trips, trip_clusters, regions, datasources RESTART IDENTITY CASCADE;"
+```
+
+> For a full reset including Kafka offsets, see [Reset and Reprocess from Scratch](#reset-and-reprocess-from-scratch).
+
+### 4. Initialize Airflow (first time only)
+
+The `airflow` database is created automatically by `sql/init.sql` when the Postgres container first starts — no manual step needed.
+
+```bash
+# Initialize the Airflow schema (Airflow 2.x uses db migrate)
+docker compose run --rm airflow-webserver airflow db migrate &&
 
 # Create an admin user
 docker compose run --rm airflow-webserver airflow users create \
   --username admin --password admin \
   --firstname Admin --lastname User \
-  --role Admin --email admin@example.com
+  --role Admin --email admin@example.com &&
 
 # Start Airflow
 docker compose up -d airflow-webserver airflow-scheduler
 ```
 
-### 4. Trigger the streaming pipeline
+### 5. Trigger the streaming pipeline
+
+**Create the Kafka topics first** — Job 1 connects to `trips.raw` at startup, and the API / Spark jobs publish SSE progress to `ingestion.status`:
 
 ```bash
+docker exec kafka kafka-topics.sh \
+  --create --topic trips.raw \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 --replication-factor 1 \
+  --if-not-exists &&
+
+docker exec kafka kafka-topics.sh \
+  --create --topic ingestion.status \
+  --bootstrap-server localhost:9092 \
+  --partitions 1 --replication-factor 1 \
+  --if-not-exists
+```
+
+Then trigger:
+
+```bash
+# Clear Airflow task state so the next trigger starts fresh
+docker exec airflow-webserver airflow tasks clear trips_streaming_pipeline \
+  --yes --downstream --upstream 2>/dev/null || true &&
+
+# Unpause DAG (required for trigger to run)
+docker exec airflow-webserver airflow dags unpause trips_streaming_pipeline
+
+# Trigger the DAG
 docker exec airflow-webserver airflow dags trigger trips_streaming_pipeline \
   --run-id "trips_streaming_$(date +%Y%m%d_%H%M)"
 ```
 
-This starts **Job 1** (Kafka → Bronze/Silver) and **Job 2** (Silver → Gold → Postgres) in parallel. Both jobs run indefinitely.
+This starts **Job 1** (Kafka → Bronze/Silver) and **Job 2** (Silver → Gold → Postgres) in parallel. Both jobs run indefinitely. On first run, Spark downloads Ivy packages (Kafka connector, Delta Lake) — wait 2–5 min before uploading.
 
-### 5. Upload the CSV
+### 6. Upload the CSV
 
 ```bash
 curl -F "file=@sample_data/trips.csv;type=text/csv" http://localhost:8000/ingestions
@@ -208,11 +244,19 @@ curl -F "file=@sample_data/trips.csv;type=text/csv" http://localhost:8000/ingest
 
 Take note of the returned `ingestion_id`.
 
-### 6. Watch ingestion status via SSE
+### 7. Watch ingestion status via SSE
 
 ```bash
-curl -N http://localhost:8000/ingestions/<ingestion_id>/events
+curl -N http://localhost:8000/ingestions/<ingstion_id>/events
 ```
+
+curl -N http://localhost:8000/ingestions/438301bd-4588-4daf-aed6-9ef8279a056a/events
+
+---
+
+### Presentation Script
+
+For live demos or presentations, use the **manual step-by-step** flow above — **not** `demo.sh`.
 
 ---
 
@@ -241,8 +285,8 @@ docker exec airflow-webserver airflow tasks clear trips_streaming_pipeline \
   --yes --downstream --upstream
 
 # Option B: kill Spark processes directly
-docker exec spark-worker pkill -f "job1.py" || true
-docker exec spark-worker pkill -f "job2.py" || true
+docker exec airflow-scheduler pkill -f "job1.py" || true
+docker exec airflow-scheduler pkill -f "job2.py" || true
 ```
 
 **2. Clear Delta tables and checkpoints**
@@ -251,6 +295,7 @@ docker exec spark-worker pkill -f "job2.py" || true
 # Remove all Delta layers
 rm -rf data/delta/bronze_trips
 rm -rf data/delta/silver_trips
+rm -rf data/delta/silver_ingestion_markers
 rm -rf data/delta/rejected_trips
 rm -rf data/delta/gold_trip_clusters
 rm -rf data/delta/gold_weekly_metrics
@@ -259,10 +304,12 @@ rm -rf data/delta/gold_weekly_metrics
 rm -rf data/checkpoints/
 ```
 
-**3. Clear the Postgres table**
+**3. Clear the Postgres tables**
+
+Job 2 writes to both `trips` (individual rows) and `trip_clusters` (aggregates). For a full reprocess, truncate both:
 
 ```bash
-docker exec -it postgres psql -U trips -d trips -c "TRUNCATE TABLE trip_clusters;"
+docker exec -it postgres psql -U trips -d trips -c "TRUNCATE TABLE trips, trip_clusters;"
 ```
 
 **4. (Optional) Recreate the Kafka topic to reset offsets**
@@ -314,12 +361,11 @@ curl -s -F "file=@sample_data/trips.csv;type=text/csv" http://localhost:8000/ing
 ```json
 {
   "ingestion_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
-  "status": "accepted",
-  "row_count": 200
+  "rows": 100
 }
 ```
 
-If `row_count > 0` and `status: accepted`, the API parsed the CSV and published the events.
+If `rows > 0`, the API parsed the CSV and queued the events for Kafka.
 
 **Follow real-time status via SSE**:
 
@@ -327,13 +373,18 @@ If `row_count > 0` and `status: accepted`, the API parsed the CSV and published 
 curl -N http://localhost:8000/ingestions/<ingestion_id>/events
 ```
 
-Expected output:
+Expected output (Phase 1 — full pipeline status):
 
 ```
-data: {"ingestion_id": "...", "status": "processing", "processed": 50}
-data: {"ingestion_id": "...", "status": "processing", "processed": 150}
-data: {"ingestion_id": "...", "status": "done", "processed": 200}
+data: {"ingestion_id": "...", "status": "STARTED"}
+data: {"ingestion_id": "...", "status": "IN_PROGRESS", "rows": 50}
+data: {"ingestion_id": "...", "status": "COMPLETED", "rows": 100}
+data: {"ingestion_id": "...", "status": "BRONZE_COMPLETED", "total_rows": 100}
+data: {"ingestion_id": "...", "status": "SILVER_COMPLETED", "total_rows": 100}
+data: {"ingestion_id": "...", "status": "TRIPS_PG_COMPLETED", "total_rows": 100, "pg_count": 100}
 ```
+
+Each stage emits only after the corresponding sink has committed successfully.
 
 ---
 
@@ -349,7 +400,7 @@ docker exec kafka kafka-run-class.sh kafka.tools.GetOffsetShell \
   --time -1
 ```
 
-**Expected result**: the offset should match the number of rows uploaded (e.g., `trips.raw:0:200`).
+**Expected result**: the offset should match the number of rows uploaded (e.g., `trips.raw:0:100` for 100 rows).
 
 **Read the first few messages from the topic**:
 
@@ -408,6 +459,14 @@ You will see 3 active queries (bronze, silver, rejected) with:
 - **Batch ID**: a number that increases with every micro-batch
 - **Input rows/sec**: current processing rate
 
+**Job 1 goes into "up for retry"** — Common causes: Kafka topic not ready, Spark master/executor not allocated in time, or Ivy package download timeout on first run. The job retries up to 2 times with 60 s delay.
+
+- Ensure Kafka is up: `docker exec kafka kafka-topics.sh --bootstrap-server localhost:9092 --list` should show `trips.raw`
+- Ensure Spark worker has enough resources (8 CPUs, 6 GB RAM — see Prerequisites)
+- On first run, Ivy downloads Kafka/Delta packages — can take 2–5 min; wait for retry or trigger the DAG again after packages are cached
+
+To inspect logs: Airflow UI → DAG → click the failed task → **Logs**.
+
 ---
 
 ### Stage 4 — Job 2 processing (Gold and Postgres)
@@ -434,6 +493,14 @@ If this directory exists, Job 2 attempted (or is attempting) to write to Postgre
 Go to `http://localhost:8080` → click the Application ID for **job2-gold-postgis** → **Structured Streaming** tab.
 
 You will see queries with status `ACTIVE` and a **Batch ID** that keeps incrementing.
+
+**Job 2 stops or retries** — If Job 2 goes into "up for retry" in Airflow or PostgreSQL counts stop growing (e.g. at ~39%), transient PostgreSQL/network issues are likely. The job now:
+
+- Retries writes up to 3 times with exponential backoff per micro-batch
+- Uses connection timeouts (15 s by default) to avoid indefinite hangs
+- Airflow retries the task up to 2 times with 30 s delay between attempts
+
+To inspect logs: Airflow UI → DAG → click the failed task → logs. Or: `docker logs airflow-scheduler` or Spark worker logs. Tune `POSTGRES_WRITE_MAX_RETRIES`, `POSTGRES_CONNECT_TIMEOUT` in `.env` if needed.
 
 ---
 
@@ -505,7 +572,7 @@ With `\watch 2` still running, the `count(*)` **should not increase** — Silver
 
 ```
 Stage 1 — API
-  curl POST /ingestions  →  status: accepted, row_count: N
+  curl POST /ingestions  →  HTTP 202, rows: N
   curl GET  /ingestions/<id>/events  →  SSE: processing → done
 
 Stage 2 — Kafka

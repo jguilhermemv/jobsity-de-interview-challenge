@@ -224,7 +224,12 @@ def _publish_events(
     publish_status(producer, ingestion_id, "STARTED")
     for row_number, event in events:
         try:
-            producer.send(TRIPS_TOPIC, value=event.model_dump(), key=event.trip_id)
+            # Use ingestion_id as Kafka key so trip rows and end marker preserve order per ingestion
+            producer.send(
+                TRIPS_TOPIC,
+                value=event.model_dump(exclude_none=True),
+                key=ingestion_id,
+            )
             row_count += 1
             if row_count % 100 == 0:
                 publish_status(
@@ -243,7 +248,17 @@ def _publish_events(
                     "trace_id": ingestion_id,
                 },
             )
-        time.sleep(PUBLISH_DELAY_SECONDS)
+        if PUBLISH_DELAY_SECONDS > 0:
+            time.sleep(PUBLISH_DELAY_SECONDS)
+
+    # End-of-ingestion marker: deterministic boundary for downstream consumers
+    marker = {
+        "record_type": "ingestion_end",
+        "ingestion_id": ingestion_id,
+        "control_id": f"{ingestion_id}:end",
+        "total_rows": row_count,
+    }
+    producer.send(TRIPS_TOPIC, value=marker, key=ingestion_id)
     producer.flush()
     publish_status(producer, ingestion_id, "COMPLETED", details={"rows": row_count})
 
@@ -337,8 +352,10 @@ def _status_stream(ingestion_id: str) -> Generator[str, None, None]:
             "content": {"text/event-stream": {}},
             "description": (
                 "SSE stream of status events. Each event has the shape "
-                "`{ingestion_id, status, details}`. "
-                "Possible `status` values: `STARTED`, `IN_PROGRESS`, `COMPLETED`."
+                "`{ingestion_id, status, details?}`. "
+                "Status sequence: `STARTED` → `IN_PROGRESS` → `COMPLETED` "
+                "(API finished publishing to Kafka) → `BRONZE_COMPLETED` → "
+                "`SILVER_COMPLETED` → `TRIPS_PG_COMPLETED`. On failure: `FAILED`."
             ),
         }
     },
@@ -352,6 +369,10 @@ def stream_ingestion_events(
     The stream emits one event per status change — no polling required.
     Connect with `curl -N http://localhost:8000/ingestions/<id>/events` or
     any `EventSource`-compatible client.
+
+    Status sequence (Phase 1): STARTED → IN_PROGRESS → COMPLETED (API done) →
+    BRONZE_COMPLETED → SILVER_COMPLETED → TRIPS_PG_COMPLETED. Each stage
+    emits only after the corresponding sink has committed successfully.
 
     The stream stays open until the Kafka consumer is closed by the client.
     """

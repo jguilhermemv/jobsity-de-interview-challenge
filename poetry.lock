@@ -842,7 +842,7 @@ version = "0.10.9.9"
 description = "Enables Python programs to dynamically access arbitrary Java objects"
 optional = false
 python-versions = "*"
-groups = ["spark"]
+groups = ["dev", "spark"]
 files = [
     {file = "py4j-0.10.9.9-py2.py3-none-any.whl", hash = "sha256:c7c26e4158defb37b0bb124933163641a2ff6e3a3913f7811b0ddbe07ed61533"},
     {file = "py4j-0.10.9.9.tar.gz", hash = "sha256:f694cad19efa5bd1dee4f3e5270eb406613c974394035e5bfc4ec1aba870b879"},
@@ -1025,7 +1025,7 @@ version = "3.5.8"
 description = "Apache Spark Python API"
 optional = false
 python-versions = ">=3.8"
-groups = ["spark"]
+groups = ["dev", "spark"]
 files = [
     {file = "pyspark-3.5.8.tar.gz", hash = "sha256:54cca0767b21b40e3953ad1d30f8601c53abf9cbda763653289cdcfcac52313c"},
 ]
@@ -1736,4 +1736,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "9bc4685b95ea61872e16eb540e0d16e4d37a9494f7155af1deb6d154296e5154"
+content-hash = "4a93e9aebe780caa12011f769188662d5908835d4f05d178dff7e0360036e67f"

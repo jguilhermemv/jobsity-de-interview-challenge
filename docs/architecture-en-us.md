@@ -97,7 +97,7 @@ A formal Event Sourcing implementation would add explicit aggregate roots, an ev
 Command Query Responsibility Segregation separates the write model from the read model. This architecture implements that separation natively:
 
 - **Write path (Command side)**: `REST API → Kafka → Spark Job 1 → Spark Job 2 → PostgreSQL` — optimized for throughput, fault tolerance, and idempotency.
-- **Read path (Query side)**: `REST API → PostgreSQL (Gold layer / trip_clusters)` — optimized for low-latency geospatial queries via pre-aggregated tables and GiST indexes.
+- **Read path (Query side)**: `REST API → PostgreSQL` — optimized for low-latency geospatial queries on `trips` (GiST indexes + PostGIS) and cluster-oriented inspection via `trip_clusters`.
 
 The two paths never share a code path and scale independently: write throughput is governed by Kafka partitions and Spark workers; read throughput is governed by PostgreSQL connection pooling and read replicas. A formal CQRS implementation would introduce explicit read-model synchronization contracts and eventual-consistency visibility guarantees for clients. That is unnecessary here because the access pattern is simple (queries by region and week), the consistency window is already defined by the Spark micro-batch interval, and there is no competing write/read contention on the same records.
 
@@ -109,7 +109,7 @@ The two paths never share a code path and scale independently: write throughput 
 
 ![Overall Flow](/docs/images/arch-img-overall-flow.png)
 
-**Reading this diagram:** The flow is fully asynchronous. The client uploads a CSV and immediately receives an `ingestion_id` (HTTP 202); the API never blocks waiting for processing to finish. Each CSV row becomes an independent Kafka event, allowing Spark to consume and process records in parallel without any coupling to upload speed. Invalid rows are diverted to a Dead Letter Queue (`trips.dlq`) rather than failing the entire batch, preserving partial results. Airflow acts as a watchdog: it submits both Spark jobs and restarts them on failure, ensuring the streaming pipelines stay alive without manual intervention. The feedback loop at the bottom — Spark jobs publishing to `ingestion.status`, the API consuming those events and forwarding them via SSE — is what satisfies the non-polling requirement: the client is notified proactively at each pipeline milestone.
+**Reading this diagram:** The flow is fully asynchronous. The client uploads a CSV and immediately receives an `ingestion_id` (HTTP 202); the API never blocks waiting for processing to finish. Each valid CSV row becomes an independent Kafka event, allowing Spark to consume and process records in parallel without any coupling to upload speed. Rows skipped by the API are logged, and rows that fail Spark-side validation are preserved in the Delta `rejected_trips` table rather than stopping the pipeline. Airflow acts as a watchdog: it submits both Spark jobs and restarts them on failure, ensuring the streaming pipelines stay alive without manual intervention. The feedback loop at the bottom — the API and Spark jobs publishing to `ingestion.status`, and the API forwarding those events via SSE — is what satisfies the non-polling requirement: the client is notified proactively at each pipeline milestone.
 
 ### 3.2 Step-by-Step Walkthrough
 
@@ -119,7 +119,7 @@ The client sends a `POST /ingestions` request with a CSV file. The API returns a
 
 **Step 2 — Event Publishing**
 
-The API parses the CSV row by row. For each valid row, it publishes a JSON event to the `trips.raw` Kafka topic. Invalid rows go to `trips.dlq` (Dead Letter Queue) for later inspection. The event schema includes:
+The API parses the CSV row by row. For each valid row, it publishes a JSON event to the `trips.raw` Kafka topic. Invalid upload rows are skipped and logged; downstream validation failures are captured separately in the Delta `rejected_trips` table. The event schema includes:
 
 ```json
 {
@@ -142,28 +142,30 @@ The `trip_id` is a deterministic hash of the trip's business key (excluding `ing
 
 Spark Structured Streaming continuously reads from `trips.raw`:
 - Writes the raw payload to the **Bronze** Delta table (schema-on-read, full audit)
-- Validates types, normalizes coordinates and datetimes, drops rows that fail validation
-- Deduplicates by `trip_id` with a watermark window (e.g., 24h)
+- Validates types, normalizes coordinates and datetimes, and writes rows that fail validation to **rejected_trips**
+- Deduplicates by `trip_id` when merging validated rows into the **Silver** Delta table
 - Writes clean records to the **Silver** Delta table
-- Publishes status events (`STARTED`, `IN_PROGRESS`, `COMPLETED`, `FAILED`) to `ingestion.status`
+- Publishes `BRONZE_COMPLETED` and `SILVER_COMPLETED` to `ingestion.status` only after the corresponding sink commits succeed
 
 **Step 4 — Gold + PostgreSQL (Spark Job 2)**
 
 A second Spark Structured Streaming job reads from Silver:
 - Computes geohash cells for origin and destination (precision 7 ≈ 150m × 150m)
 - Assigns 30-minute time buckets
-- Groups trips by `(origin_cell, destination_cell, time_bucket, iso_week)` to produce **trip clusters**
-- Incrementally upserts cluster aggregates and trip records into PostgreSQL + PostGIS
+- Produces **Gold** Delta tables for trip clusters and weekly metrics
+- Inserts individual trip records into PostgreSQL + PostGIS idempotently with `ON CONFLICT (trip_id) DO NOTHING`
+- Appends cluster aggregate snapshots to PostgreSQL with retry/backoff and connection timeouts
+- Verifies ingestion completion from Silver markers and emits `TRIPS_PG_COMPLETED`
 
 **Step 5 — Status Notification**
 
-At each pipeline transition, a status event is published to `ingestion.status`. The API consumes this topic and forwards updates to connected clients via **Server-Sent Events (SSE)**. The client holds a single long-lived HTTP connection and receives push notifications — no polling required.
+At each pipeline transition, a status event is published to `ingestion.status`. The API consumes this topic and forwards updates to connected clients via **Server-Sent Events (SSE)**. The client holds a single long-lived HTTP connection and receives push notifications — no polling required. The end-to-end sequence is `STARTED → IN_PROGRESS → COMPLETED → BRONZE_COMPLETED → SILVER_COMPLETED → TRIPS_PG_COMPLETED`.
 
 ### 3.3 Ingestion Status Sequence
 
 ![Overall Flow](/docs/images/arch-img-ingestion-status-sequence.png)
 
-**Reading this diagram:** This sequence answers requirement R4 — *"inform the user about the status of data ingestion without using a polling solution."* The key insight is that the client opens a **single persistent HTTP connection** (`GET /ingestions/{id}/status`) immediately after receiving the `ingestion_id`. From that point, all status transitions are **pushed** to the client by the server. There is no repeated request; the client just listens. The Kafka `ingestion.status` topic is the coordination bus: every Spark job publishes an event at each milestone (`BRONZE_STARTED`, `SILVER_COMPLETED`, `COMPLETED`), and the API relays those events directly to the client's SSE stream. The `alt` block shows the failure path: even on error, the client receives a notification automatically — Airflow then restarts the job using its existing checkpoint, so processing resumes from exactly where it stopped rather than reprocessing from the beginning.
+**Reading this diagram:** This sequence answers requirement R4 — *"inform the user about the status of data ingestion without using a polling solution."* The key insight is that the client opens a **single persistent HTTP connection** (`GET /ingestions/{id}/events`) immediately after receiving the `ingestion_id`. From that point, all status transitions are **pushed** to the client by the server. There is no repeated request; the client just listens. The Kafka `ingestion.status` topic is the coordination bus: the API emits `STARTED`, `IN_PROGRESS`, and `COMPLETED`; Spark emits `BRONZE_COMPLETED`, `SILVER_COMPLETED`, and `TRIPS_PG_COMPLETED` only after sink commits succeed. The `alt` block shows the failure path: even on error, the client receives a notification automatically — Airflow then restarts the job using its existing checkpoint, so processing resumes from exactly where it stopped rather than reprocessing from the beginning.
 
 ---
 
@@ -183,7 +185,7 @@ At each pipeline transition, a status event is published to `ingestion.status`. 
 
 ![Overall Flow](/docs/images/arch-img-c4-container.png)
 
-**There are seven deployable units**, each running as a separate Docker container. Notice that Kafka appears in three roles simultaneously: it receives events from the API (`trips.raw`, `trips.dlq`), delivers them to Spark Job 1 for processing, and carries status events back to the API (`ingestion.status`). This makes Kafka the **central nervous system** of the platform — every cross-container communication passes through it, which is why no container directly calls another's HTTP API. The only exceptions are Airflow (which uses `spark-submit` to start Spark jobs) and Spark Job 2 (which writes to PostgreSQL via JDBC). Delta Lake is the hand-off point between the two Spark jobs: Job 1 writes Silver, Job 2 reads Silver — they never communicate directly. This design means each job can fail and recover independently without affecting the other.
+**There are seven deployable units**, each running as a separate Docker container. Notice that Kafka appears in two roles simultaneously: it receives trip events from the API (`trips.raw`) and carries status events back to the API (`ingestion.status`). This makes Kafka the **central nervous system** of the platform — every cross-container communication passes through it, which is why no container directly calls another's HTTP API. Rejected records are persisted in Delta (`rejected_trips`) instead of a separate Kafka DLQ. The only exceptions are Airflow (which uses `spark-submit` to start Spark jobs) and Spark Job 2 (which writes to PostgreSQL). Delta Lake is the hand-off point between the two Spark jobs: Job 1 writes Silver, Job 2 reads Silver — they never communicate directly. This design means each job can fail and recover independently without affecting the other.
 
 ### 4.3 Level 3 — Component Diagram (REST API)
 
@@ -200,7 +202,7 @@ At each pipeline transition, a status event is published to `ingestion.status`. 
 ![Overall Flow](/docs/images/arch-img-c4-spark-job-1.png)
 
 
-**The Kafka Source fans out into two parallel paths in every micro-batch.** The Bronze Writer receives the raw, untouched micro-batch first — before any validation — ensuring that even records that will later be rejected are preserved in the audit layer. Simultaneously, the Row Validator applies domain rules (coordinate ranges, datetime format, required fields) and splits the batch: invalid rows go to the Dead Letter Queue topic, valid rows proceed to the Deduplicator. The Deduplicator uses Spark's `dropDuplicates` combined with a watermark window to handle late-arriving or repeated events across micro-batches — critical for idempotent re-ingestion. Only after deduplication does the Silver Writer commit clean records to Delta Lake. At each of these transitions, the Status Publisher emits a Kafka event, providing the fine-grained progress updates that drive the client's SSE stream.
+**The Kafka Source fans out into two parallel paths in every micro-batch.** The Bronze Writer receives the raw, untouched micro-batch first — before any validation — ensuring that even records that will later be rejected are preserved in the audit layer. Simultaneously, the Row Validator applies domain rules (coordinate ranges, datetime format, required fields) and splits the batch: invalid rows are written to the Delta `rejected_trips` table, valid rows proceed to the Deduplicator. The Deduplicator uses a `Delta MERGE` on `trip_id` when writing into Silver, making repeated uploads idempotent without requiring a separate relational dedup step. Only after deduplication does the Silver Writer commit clean records to Delta Lake. After those commits succeed, the Status Publisher emits `BRONZE_COMPLETED` and `SILVER_COMPLETED`, providing the progress updates that drive the client's SSE stream.
 
 ### 4.5 Level 3 — Component Diagram (Spark Job 2)
 
@@ -208,9 +210,9 @@ At each pipeline transition, a status event is published to `ingestion.status`. 
 
 ![Spark Job 2](/docs/images/arch-img-c4-spark-job-2.png)
 
-**The Silver Reader is the single entry point: Job 2 never touches Kafka directly.** It continuously reads new micro-batches from the Silver Delta table using Structured Streaming's change-data-capture mechanism — only records committed by Job 1 since the last checkpoint are processed, ensuring the two jobs are fully decoupled and independently restartable. Each incoming record passes through the **Geohash Encoder**, which converts the raw lon/lat coordinates into a Geohash-7 string (one cell ≈ 150m × 150m) for both origin and destination. Simultaneously, the **Time Bucketer** truncates the trip datetime to the nearest 30-minute boundary, producing a normalized `time_bucket` value. These two enrichments are computed in the same Spark transformation step with no I/O cost.
+**The Silver Reader is the single entry point: Job 2 never touches Kafka trip data directly.** It continuously reads new micro-batches from the Silver Delta table and the Silver ingestion-marker table, ensuring the two jobs remain fully decoupled and independently restartable. Each incoming record passes through the **Geohash Encoder**, which converts the raw lon/lat coordinates into a Geohash-7 string (one cell ≈ 150m × 150m) for both origin and destination. Simultaneously, the **Time Bucketer** truncates the trip datetime to the nearest 30-minute boundary, producing a normalized `time_bucket` value. These enrichments are computed in Spark with no extra I/O step.
 
-The enriched records flow into the **Cluster Aggregator**, which groups trips by the composite key `(origin_cell, destination_cell, time_bucket, iso_week)` and increments the cluster trip count. This is the core of the similarity grouping logic: two trips that share the same composite key are considered spatially and temporally similar. From the Cluster Aggregator, two parallel write paths diverge. The **Trip Writer** upserts individual trip records — including PostGIS `POINT` geometry columns — into the `trips` table, using `trip_id` as the conflict key to enforce idempotency. The **Cluster Writer** upserts the aggregated cluster counts into the `trip_clusters` table, applying an `ON CONFLICT DO UPDATE` strategy so that repeated micro-batches accumulate counts rather than duplicating rows. Both writers use batched JDBC inserts (configurable batch size, e.g., 5,000 rows) to minimize round-trips to PostgreSQL. Finally, the **Status Publisher** emits `GOLD_STARTED`, `GOLD_COMPLETED`, and `FAILED` events to the `ingestion.status` Kafka topic, closing the feedback loop that drives the client's SSE stream.
+The enriched records flow into the **Cluster Aggregator**, which groups trips by the composite key `(origin_cell, destination_cell, time_bucket, iso_week)`. This is the core of the similarity grouping logic: two trips that share the same composite key are considered spatially and temporally similar. From there, Job 2 materializes two Gold Delta projections (`trip_clusters` and `weekly_metrics`) and opens two PostgreSQL write paths. The **Trip Writer** inserts individual trip records into the `trips` table using `ON CONFLICT (trip_id) DO NOTHING`, making the write idempotent across retries and restarts. The **Cluster Writer** appends aggregated cluster snapshots to the `trip_clusters` table with retry/backoff and connection timeouts to tolerate transient PostgreSQL failures. Finally, the **Completion Checker** consumes Silver ingestion markers, waits until PostgreSQL row counts match the expected total, and emits `TRIPS_PG_COMPLETED` to `ingestion.status`, closing the feedback loop that drives the client's SSE stream.
 
 ---
 
@@ -256,18 +258,21 @@ Precision 7 was chosen as the default. It can be tuned via a configuration param
 
 **Querying weekly averages**
 
-The `trip_clusters` Gold table stores pre-aggregated counts by `(origin_cell, dest_cell, time_bucket, iso_week)`. Weekly averages by region or bounding box are computed as:
+The current API computes weekly averages from the `trips` table (and can also rely on the `weekly_trips_by_region` view for region-oriented inspection). This keeps region and bounding-box filters aligned with the row-level serving model used by the FastAPI endpoints:
 
 ```sql
 -- Weekly average by region name
-SELECT
-    r.region_name,
-    AVG(tc.trip_count) AS avg_weekly_trips
-FROM trip_clusters tc
-JOIN regions r ON tc.region_id = r.region_id
-WHERE r.region_name = 'Prague'
-  AND tc.iso_week BETWEEN 18 AND 22
-GROUP BY r.region_name;
+WITH weekly AS (
+    SELECT DATE_TRUNC('week', datetime) AS week_start,
+           COUNT(*)                     AS trip_count
+    FROM trips
+    WHERE region = 'Prague'
+    GROUP BY week_start
+)
+SELECT AVG(trip_count) AS weekly_average,
+       COUNT(*)        AS num_weeks,
+       SUM(trip_count) AS total_trips
+FROM weekly;
 
 -- Weekly average by bounding box (PostGIS)
 SELECT
@@ -284,17 +289,17 @@ ORDER BY iso_week;
 
 **Non-polling status**
 
-The API exposes a `GET /ingestions/{ingestion_id}/status` endpoint that returns an **SSE (Server-Sent Events)** stream. The client opens one persistent HTTP connection and receives push notifications as the pipeline progresses:
+The API exposes a `GET /ingestions/{ingestion_id}/events` endpoint that returns an **SSE (Server-Sent Events)** stream. The client opens one persistent HTTP connection and receives push notifications as the pipeline progresses:
 
 ```
 event: status
-data: {"ingestion_id": "...", "state": "BRONZE_STARTED", "timestamp": "..."}
+data: {"ingestion_id": "...", "status": "STARTED"}
 
 event: status
-data: {"ingestion_id": "...", "state": "SILVER_COMPLETED", "rows_processed": 100}
+data: {"ingestion_id": "...", "status": "SILVER_COMPLETED", "total_rows": 100}
 
 event: status
-data: {"ingestion_id": "...", "state": "COMPLETED", "rows_processed": 100, "rows_rejected": 0}
+data: {"ingestion_id": "...", "status": "TRIPS_PG_COMPLETED", "total_rows": 100, "pg_count": 100}
 ```
 
 SSE was chosen over WebSocket because the status stream is **unidirectional** (server → client) and SSE works over plain HTTP/1.1 with automatic reconnection, requiring no additional protocol handshake.
@@ -353,7 +358,7 @@ PostgreSQL table partitioning by `ingestion_month` ensures that queries targetin
 | REST API | CPU / memory per upload | Horizontal (multiple containers + LB) |
 | Kafka | Throughput per partition | Add partitions; add brokers |
 | Spark Job 1 | Executor parallelism | Add workers; tune `maxOffsetsPerTrigger` |
-| Spark Job 2 | JDBC write throughput | Batch upserts; connection pool tuning |
+| Spark Job 2 | PostgreSQL write throughput | Idempotent trip inserts, cluster append snapshots, retries/backoff |
 | Delta Lake | File count / scan size | Partitioning + Z-Order + OPTIMIZE |
 | PostgreSQL | Query scan cost | Partitioning + GiST + pre-aggregation |
 
@@ -365,16 +370,6 @@ PostgreSQL table partitioning by `ingestion_month` ensures that queries targetin
 
 ```mermaid
 erDiagram
-    INGESTIONS {
-        uuid ingestion_id PK
-        timestamp started_at
-        timestamp completed_at
-        int rows_total
-        int rows_processed
-        int rows_rejected
-        varchar status
-    }
-
     DATASOURCES {
         serial datasource_id PK
         varchar datasource_name
@@ -388,39 +383,32 @@ erDiagram
 
     TRIPS {
         varchar trip_id PK
-        int region_id FK
-        int datasource_id FK
-        uuid ingestion_id FK
+        varchar ingestion_id
+        varchar region
+        double origin_lon
+        double origin_lat
+        double destination_lon
+        double destination_lat
         geometry origin_geom
         geometry destination_geom
         varchar origin_geohash
         varchar destination_geohash
         timestamp datetime
-        int time_bucket_minutes
-        int iso_week
-        int iso_year
+        varchar datasource
         timestamp ingested_at
     }
 
     TRIP_CLUSTERS {
         serial cluster_id PK
-        int region_id FK
         varchar origin_cell
         varchar destination_cell
-        int time_bucket_minutes
+        timestamp time_bucket
         int iso_week
-        int iso_year
         int trip_count
-        timestamp last_updated
     }
-
-    INGESTIONS ||--o{ TRIPS : "produces"
-    REGIONS ||--o{ TRIPS : "belongs to"
-    DATASOURCES ||--o{ TRIPS : "reported by"
-    REGIONS ||--o{ TRIP_CLUSTERS : "aggregated in"
 ```
 
-**The model is designed around two access patterns.** The `TRIPS` table serves ad-hoc geospatial queries (bounding box lookups, region filters) using PostGIS geometry columns and GiST indexes. The `TRIP_CLUSTERS` table serves the high-frequency weekly average queries: instead of scanning all trips, the query reads the pre-aggregated cluster counts — a table that is orders of magnitude smaller. Notice that `TRIPS` stores both a `geometry` column (for spatial queries) and a `geohash` string (for grouping joins with `TRIP_CLUSTERS`); they represent the same location in two formats optimized for different query types. The `INGESTIONS` table provides full traceability: every trip row knows which upload batch it came from, enabling audits like "show me all trips from last Friday's upload" or "how many rows were rejected in ingestion X."
+**The physical model is intentionally flat so Spark can write directly into PostgreSQL without complex type-mapping or foreign-key orchestration.** The `TRIPS` table serves the API's geospatial and weekly-average queries using PostGIS geometry columns and GiST indexes, while `TRIP_CLUSTERS` stores Gold-level aggregation snapshots for similarity analysis and operational validation. `REGIONS` and `DATASOURCES` are lookup tables populated automatically by a trigger on `trips` inserts. There is no dedicated `INGESTIONS` table in PostgreSQL today; ingestion traceability is preserved through the `ingestion_id` column on each trip row plus the Kafka/SSE status stream.
 
 ### 6.2 Key Design Decisions
 
@@ -440,9 +428,9 @@ This enables idempotent re-ingestion: uploading the same CSV twice does not dupl
 - `ST_Distance` for proximity calculations
 - `GiST` spatial indexes for sub-millisecond geospatial lookups
 
-**`trip_clusters` as the query-acceleration layer**
+**`trip_clusters` as the Gold aggregation layer**
 
-Pre-aggregating cluster counts in a dedicated table reduces the weekly average query from a full scan of 100M rows to a scan of O(weeks × regions × geohash_cells) rows — typically millions of times fewer rows.
+The current API computes weekly averages from `trips`, because region filters and PostGIS bounding-box filters map directly to row-level data. `trip_clusters` still matters as the Gold projection for similarity grouping, validation demos, and future BI-style queries over clustered movement patterns.
 
 ---
 
@@ -687,10 +675,10 @@ The key insight is that the local Airflow + Spark + Delta Lake triad collapses i
 | **DRY** | Shared domain entities (`Trip`, `Ingestion`, `Region`) used by both API and Spark |
 | **Clean Architecture** | Domain layer has zero infrastructure dependencies; Kafka/Spark/DB are adapters |
 | **Event Sourcing** | Bronze table is the immutable event log; Silver and Gold are derived views |
-| **Defense in Depth** | DLQ for invalid rows; watermark deduplication; unique constraint on `trip_id` in PostgreSQL |
+| **Defense in Depth** | `rejected_trips` Delta table for invalid rows; deduplication by `trip_id`; unique constraint on `trip_id` in PostgreSQL |
 
 ### Final Remarks
 
-The challenge asked for a solution that "simplifies the data by a data model" and provides "proof of scalability." The answer to both is the **trip_clusters Gold table**: it reduces query cost from O(100M rows) to O(weeks × regions × geohash cells), and the mathematical argument in Section 5.3 demonstrates why the architecture scales without code changes.
+The challenge asked for a solution that "simplifies the data by a data model" and provides "proof of scalability." The answer is the combination of a **flat PostGIS serving table** (`trips`) and **Gold streaming projections** (`trip_clusters`, `weekly_metrics`): the first keeps the API simple and flexible, while the second proves that the architecture can materialize higher-level views without changing the ingestion contract.
 
 The non-polling status requirement — often solved with polling disguised as "short polling" — is addressed properly here with an event-driven SSE stream backed by Kafka, which also serves as the coordination backbone for the entire pipeline.

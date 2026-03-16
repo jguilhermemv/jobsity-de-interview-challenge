@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import pendulum
-from airflow import DAG
-from airflow.operators.bash import BashOperator
+import pendulum  # type: ignore[import-untyped]
+from airflow import DAG  # type: ignore[import-untyped]
+from airflow.operators.bash import BashOperator  # type: ignore[import-untyped]
 
 SPARK_PACKAGES = ",".join(
     [
@@ -11,7 +11,7 @@ SPARK_PACKAGES = ",".join(
         "org.postgresql:postgresql:42.7.3",
     ]
 )
-SPARK_IVY_DIR = "/opt/airflow/.ivy2/${AIRFLOW_CTX_TASK_ID}"
+SPARK_IVY_DIR = "/opt/airflow/.ivy2/shared"
 SPARK_DRIVER_PYTHONPATH = "/opt/airflow/src"
 SPARK_EXECUTOR_PYTHONPATH = "/opt/spark-apps"
 SPARK_DRIVER_PYTHON = "/home/airflow/.local/bin/python3"
@@ -31,11 +31,12 @@ SPARK_SUBMIT = (
     "--conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog"
 )
 SPARK_RESOURCES = (
-    "--conf spark.cores.max=1 "
-    "--conf spark.executor.cores=1 "
-    "--conf spark.sql.shuffle.partitions=4 "
-    "--conf spark.executor.memory=768m "
-    "--conf spark.driver.memory=1g"
+    "--conf spark.cores.max=2 "
+    "--conf spark.executor.cores=2 "
+    "--conf spark.sql.shuffle.partitions=2 "
+    "--conf spark.executor.memory=1024m "
+    "--conf spark.executor.memoryOverhead=256m "
+    "--conf spark.driver.memory=768m"
 )
 JOB1 = "/opt/airflow/src/de_challenge/spark/job1.py"
 JOB2 = "/opt/airflow/src/de_challenge/spark/job2.py"
@@ -52,11 +53,13 @@ with DAG(
     job1 = BashOperator(
         task_id="bronze_to_silver_stream",
         bash_command=f"{SPARK_SUBMIT} {SPARK_RESOURCES} {JOB1}",
-        retries=1,
+        retries=2,
+        retry_delay=pendulum.duration(seconds=60),
     )
 
     job2 = BashOperator(
         task_id="silver_to_gold_stream",
         bash_command=f"{SPARK_SUBMIT} {SPARK_RESOURCES} {JOB2}",
-        retries=1,
+        retries=2,
+        retry_delay=pendulum.duration(seconds=30),
     )
