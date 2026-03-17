@@ -86,7 +86,7 @@ Spark Structured Streaming processes data in time windows (micro-batches), not r
 
 ## Demo Throughput — Why Processing 100 Rows Takes ~10 Minutes
 
-When running `bash demo.sh`, the full pipeline (upload → PostgreSQL) takes roughly **9–12 minutes** for the 100-row sample. This is **intentional**, not a performance issue. Three factors combine:
+When running the local end-to-end flow (upload → PostgreSQL), the full pipeline takes roughly **9–12 minutes** for the 100-row sample. This is **intentional**, not a performance issue. Three factors combine:
 
 ### 1. Intentional publish delay (`PUBLISH_DELAY_SECONDS=0.5`)
 
@@ -335,7 +335,7 @@ bash scripts/manual_demo/9_query_weekly_average.sh
 
 For live demos or presentations, prefer the numbered scripts in `scripts/manual_demo/` because they preserve the same staged narrative as the manual flow without forcing you to type every command live.
 
-Use `demo.sh` when you want a single unattended end-to-end run. Use `scripts/manual_demo/*.sh` when you want to narrate each stage separately during the recording.
+Use `scripts/manual_demo/*.sh` when you want to narrate each stage separately during the recording.
 
 ---
 
