@@ -144,6 +144,22 @@ The Spark worker requires 8 CPUs and 6 GB (`docker-compose.yml`). With less, Job
 
 ### Manual Step-by-step
 
+If you prefer not to type each command during a presentation, the same flow is available as numbered scripts in `scripts/manual_demo/`:
+
+```bash
+bash scripts/manual_demo/1_setup_env.sh
+bash scripts/manual_demo/2_start_stack.sh
+bash scripts/manual_demo/3_reset_state.sh
+bash scripts/manual_demo/4_init_airflow.sh
+bash scripts/manual_demo/5_trigger_pipeline.sh
+bash scripts/manual_demo/6_upload_csv.sh
+bash scripts/manual_demo/7_watch_sse.sh
+bash scripts/manual_demo/8_show_grouped_trips.sh
+bash scripts/manual_demo/9_query_weekly_average.sh
+```
+
+These scripts map 1:1 to the sections below and can be executed from any directory because they automatically switch to the repository root.
+
 ### 1. Set up environment variables
 
 ```bash
@@ -244,19 +260,82 @@ curl -F "file=@sample_data/trips.csv;type=text/csv" http://localhost:8000/ingest
 
 Take note of the returned `ingestion_id`.
 
+Script alternative:
+
+```bash
+bash scripts/manual_demo/6_upload_csv.sh
+```
+
+To upload a different file:
+
+```bash
+bash scripts/manual_demo/6_upload_csv.sh path/to/file.csv
+```
+
 ### 7. Watch ingestion status via SSE
 
 ```bash
-curl -N http://localhost:8000/ingestions/<ingstion_id>/events
+curl -N http://localhost:8000/ingestions/<ingestion_id>/events
 ```
 
 curl -N http://localhost:8000/ingestions/438301bd-4588-4daf-aed6-9ef8279a056a/events
+
+Script alternative:
+
+```bash
+bash scripts/manual_demo/7_watch_sse.sh
+```
+
+The script above automatically reuses the last `ingestion_id` returned by `6_upload_csv.sh`. You can also pass an explicit id:
+
+```bash
+bash scripts/manual_demo/7_watch_sse.sh 438301bd-4588-4daf-aed6-9ef8279a056a
+```
+
+### 8. Show grouped trips
+
+This demonstrates the challenge requirement to group trips by similar origin, destination, and time of day.
+
+```bash
+docker exec -i postgres psql -U trips -d trips -c \
+  "SELECT origin_cell, destination_cell, time_bucket, trip_count, iso_week FROM trip_clusters ORDER BY trip_count DESC LIMIT 10;"
+```
+
+Script alternative:
+
+```bash
+bash scripts/manual_demo/8_show_grouped_trips.sh
+```
+
+### 9. Query weekly average by region and bounding box
+
+This demonstrates the challenge requirement to obtain the weekly average number of trips for an area defined by region or coordinates.
+
+By region:
+
+```bash
+curl "http://localhost:8000/trips/weekly-average?region=Prague"
+```
+
+By bounding box:
+
+```bash
+curl "http://localhost:8000/trips/weekly-average?min_lon=14.0&min_lat=49.9&max_lon=14.6&max_lat=50.2"
+```
+
+Script alternative:
+
+```bash
+bash scripts/manual_demo/9_query_weekly_average.sh
+```
 
 ---
 
 ### Presentation Script
 
-For live demos or presentations, use the **manual step-by-step** flow above — **not** `demo.sh`.
+For live demos or presentations, prefer the numbered scripts in `scripts/manual_demo/` because they preserve the same staged narrative as the manual flow without forcing you to type every command live.
+
+Use `demo.sh` when you want a single unattended end-to-end run. Use `scripts/manual_demo/*.sh` when you want to narrate each stage separately during the recording.
 
 ---
 
