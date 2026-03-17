@@ -1,12 +1,25 @@
+# --- Project Planning ---
 plan.md
-**/__pycache__/**
-**/__pycache__
+
+# --- Python Compiled Files ---
+**/__pycache__/
 *.pyc
+
+# --- Data Folders ---
 data/airflow/
 data/postgres/
 data/checkpoints/
 data/delta/
+
+# --- Logs and State ---
 logs/
+.demo_state/
+
+# --- Node.js ---
 node_modules/
-docs/.DS_Store
+
+# --- Internal Documentation/Artifacts ---
+docs/internals/
+
+# --- System and OS Files ---
 .DS_Store
